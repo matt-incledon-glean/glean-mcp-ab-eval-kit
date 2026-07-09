@@ -1,0 +1,120 @@
+import json
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+import glean_mcp_eval as gme  # noqa: E402
+
+
+class TranscriptParserTest(unittest.TestCase):
+    def test_parse_usage_models_and_mcp_tools(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "session.jsonl"
+            rows = [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "model": "claude-opus-test",
+                        "usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 20,
+                            "cache_creation_input_tokens": 300,
+                            "cache_read_input_tokens": 400,
+                        },
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_1", "name": "mcp__glean__search", "input": {"query": "x"}},
+                            {"type": "text", "text": "done"},
+                        ],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "model": "claude-opus-test",
+                        "usage": {"input_tokens": 7, "output_tokens": 3, "server_tool_use_tokens": 11},
+                        "content": [{"type": "tool_use", "id": "toolu_2", "name": "mcp__slack__search", "input": {}}],
+                    },
+                },
+            ]
+            p.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+            parsed = gme.parse_transcript(p)
+            self.assertTrue(parsed["found"])
+            self.assertEqual(parsed["usage"]["input_tokens"], 107)
+            self.assertEqual(parsed["usage"]["output_tokens"], 23)
+            self.assertEqual(parsed["usage"]["cache_creation_input_tokens"], 300)
+            self.assertEqual(parsed["usage"]["cache_read_input_tokens"], 400)
+            self.assertEqual(parsed["unknown_usage"]["server_tool_use_tokens"], 11)
+            self.assertEqual(parsed["models"], {"claude-opus-test": 2})
+            self.assertEqual(parsed["mcp_servers_used"], {"glean": 1, "slack": 1})
+            self.assertTrue(parsed["retrieval_attempted"])
+
+
+class ReportTest(unittest.TestCase):
+    def test_report_from_synthetic_pair(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "golden_prompts.tsv").write_text("ID\tDept\tPrompt\nQ1\tEng\tQuestion?\n", encoding="utf-8")
+            cfg = {
+                "eval_name": "unit",
+                "prompts_file": "golden_prompts.tsv",
+                "results_dir": "results",
+                "pricing_per_million": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "cache_creation_input_tokens": 1,
+                    "cache_read_input_tokens": 1,
+                },
+                "arms": {"glean": {}, "direct": {}},
+            }
+            cfg_path = root / "eval.config.json"
+            cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+            for arm, tokens in [("glean", 100), ("direct", 200)]:
+                d = root / "results" / "p1" / arm / "Q1"
+                d.mkdir(parents=True)
+                (d / "metadata.json").write_text(json.dumps({"id": "Q1", "dept": "Eng", "prompt": "Question?"}), encoding="utf-8")
+                (d / "answer.md").write_text(f"{arm} answer", encoding="utf-8")
+                run = {
+                    "success": True,
+                    "total_tokens": tokens,
+                    "computed_cost_usd": tokens / 1_000_000,
+                    "usage": {"input_tokens": tokens, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+                    "transcript": {"retrieval_attempted": True, "models": {"m": 1}, "mcp_servers_used": {arm: 1}},
+                }
+                (d / "run.json").write_text(json.dumps(run), encoding="utf-8")
+            rc = gme.main(["report", "--config", str(cfg_path)])
+            self.assertEqual(rc, 0)
+            summary = (root / "results" / "aggregate_summary.md").read_text(encoding="utf-8")
+            self.assertIn("50.0% lower for Glean", summary)
+            csv_text = (root / "results" / "aggregate_rows.csv").read_text(encoding="utf-8")
+            self.assertIn("Q1", csv_text)
+
+    def test_import_participant_submission_zip(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = {"eval_name": "unit", "prompts_file": "golden_prompts.tsv", "results_dir": "results", "arms": {"glean": {}, "direct": {}}}
+            cfg_path = root / "eval.config.json"
+            cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+            (root / "golden_prompts.tsv").write_text("ID\tPrompt\nQ1\tQuestion?\n", encoding="utf-8")
+
+            src = root / "submission_src"
+            participant_run = src / "customer01" / "glean" / "Q1"
+            participant_run.mkdir(parents=True)
+            (participant_run / "run.json").write_text(json.dumps({"success": True}), encoding="utf-8")
+            (participant_run / "metadata.json").write_text(json.dumps({"id": "Q1"}), encoding="utf-8")
+            zip_path = root / "eval_submission.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                for p in src.rglob("*"):
+                    if p.is_file():
+                        zf.write(p, arcname=p.relative_to(src).as_posix())
+
+            rc = gme.main(["import", "--config", str(cfg_path), str(zip_path)])
+            self.assertEqual(rc, 0)
+            self.assertTrue((root / "results" / "customer01" / "glean" / "Q1" / "run.json").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

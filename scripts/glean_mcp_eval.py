@@ -1,0 +1,1157 @@
+#!/usr/bin/env python3
+"""Glean MCP A/B Eval Kit.
+
+Dependency-free CLI for running a crossover evaluation of Glean MCP vs direct
+vendor MCPs in Claude Code.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import zipfile
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+
+DEFAULT_CONFIG = "eval.config.json"
+
+
+class EvalError(Exception):
+    pass
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def slug_ts() -> str:
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def read_json(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def load_config(path: str) -> Tuple[Path, Dict[str, Any]]:
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        raise EvalError(f"Config not found: {p}")
+    cfg = read_json(p)
+    if "arms" not in cfg or not isinstance(cfg["arms"], dict):
+        raise EvalError("Config must contain an arms object")
+    return p, cfg
+
+
+def repo_root_for_config(config_path: Path) -> Path:
+    return config_path.parent
+
+
+def results_dir(config_path: Path, cfg: Dict[str, Any]) -> Path:
+    root = repo_root_for_config(config_path)
+    return (root / cfg.get("results_dir", "results")).resolve()
+
+
+def load_prompts(config_path: Path, cfg: Dict[str, Any]) -> List[Dict[str, str]]:
+    root = repo_root_for_config(config_path)
+    prompt_file = Path(cfg.get("prompts_file", "golden_prompts.tsv"))
+    if not prompt_file.is_absolute():
+        prompt_file = root / prompt_file
+    if not prompt_file.exists():
+        raise EvalError(f"Prompts file not found: {prompt_file}")
+    with prompt_file.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        required = {"ID", "Prompt"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise EvalError(f"Prompt TSV must include columns {sorted(required)}")
+        rows = []
+        for row in reader:
+            if not row.get("ID") or not row.get("Prompt"):
+                continue
+            rows.append({k: (v or "") for k, v in row.items()})
+    if not rows:
+        raise EvalError(f"No prompts found in {prompt_file}")
+    return rows
+
+
+def arm_config(cfg: Dict[str, Any], arm: str) -> Dict[str, Any]:
+    arms = cfg.get("arms", {})
+    if arm not in arms:
+        raise EvalError(f"Unknown arm {arm!r}; expected one of {', '.join(sorted(arms))}")
+    return arms[arm]
+
+
+def normalize_server_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9_-]+", "", name.lower().strip())
+
+
+def recursively_find_mcp_servers(obj: Any, out: Counter) -> None:
+    if isinstance(obj, dict):
+        if isinstance(obj.get("mcpServers"), dict):
+            for name in obj["mcpServers"].keys():
+                out[normalize_server_name(name)] += 1
+        for v in obj.values():
+            recursively_find_mcp_servers(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            recursively_find_mcp_servers(v, out)
+
+
+def claude_config_paths(root: Path) -> List[Path]:
+    home = Path.home()
+    candidates = [
+        root / ".mcp.json",
+        root / ".claude" / "settings.json",
+        root / ".claude" / "settings.local.json",
+        home / ".claude" / "settings.json",
+        home / ".claude.json",
+    ]
+    if sys.platform == "darwin":
+        candidates.append(home / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json")
+    elif os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.append(Path(appdata) / "Claude" / "claude_desktop_config.json")
+    else:
+        candidates.append(home / ".config" / "Claude" / "claude_desktop_config.json")
+    # Preserve order and uniqueness.
+    seen = set()
+    unique = []
+    for p in candidates:
+        rp = p.expanduser()
+        if str(rp) not in seen:
+            unique.append(rp)
+            seen.add(str(rp))
+    return unique
+
+
+def static_mcp_inventory(root: Path) -> Dict[str, Any]:
+    counts: Counter = Counter()
+    files = []
+    errors = []
+    for p in claude_config_paths(root):
+        if not p.exists():
+            continue
+        try:
+            data = read_json(p)
+            before = counts.copy()
+            recursively_find_mcp_servers(data, counts)
+            discovered = sorted((counts - before).elements())
+            files.append({"path": str(p), "servers_found": sorted(set(discovered))})
+        except Exception as e:  # noqa: BLE001 - report, don't fail.
+            errors.append({"path": str(p), "error": str(e)})
+    return {"servers": sorted(counts.keys()), "files": files, "errors": errors}
+
+
+def run_subprocess(cmd: List[str], cwd: Path, timeout: Optional[int] = None) -> Dict[str, Any]:
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "cmd": cmd,
+            "cwd": str(cwd),
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "duration_seconds": round(time.time() - started, 3),
+        }
+    except FileNotFoundError as e:
+        return {
+            "cmd": cmd,
+            "cwd": str(cwd),
+            "returncode": 127,
+            "stdout": "",
+            "stderr": str(e),
+            "duration_seconds": round(time.time() - started, 3),
+        }
+    except subprocess.TimeoutExpired as e:
+        return {
+            "cmd": cmd,
+            "cwd": str(cwd),
+            "returncode": 124,
+            "stdout": e.stdout or "",
+            "stderr": (e.stderr or "") + f"\nTimed out after {timeout}s",
+            "duration_seconds": round(time.time() - started, 3),
+        }
+
+
+def claude_mcp_list(root: Path) -> Dict[str, Any]:
+    if shutil.which("claude") is None:
+        return {"available": False, "error": "claude CLI not found on PATH", "raw": None, "servers_hint": []}
+    res = run_subprocess(["claude", "mcp", "list"], cwd=root, timeout=60)
+    raw = (res.get("stdout") or "") + "\n" + (res.get("stderr") or "")
+    hints = set()
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # Common forms include bullets/status glyphs followed by the server name.
+        s = re.sub(r"^[✓✔✗!⏸\-•*\s]+", "", s)
+        m = re.match(r"([A-Za-z0-9_.-]+)", s)
+        if m and m.group(1).lower() not in {"no", "error", "failed", "name", "mcp"}:
+            hints.add(normalize_server_name(m.group(1)))
+    return {"available": True, "raw": res, "servers_hint": sorted(hints)}
+
+
+def server_present(server: str, inventory: Dict[str, Any], mcp_list: Dict[str, Any]) -> bool:
+    s = normalize_server_name(server)
+    static = set(inventory.get("servers", []))
+    hinted = set(mcp_list.get("servers_hint", []))
+    raw = json.dumps(mcp_list.get("raw") or {}).lower()
+    return s in static or s in hinted or bool(s and s in raw)
+
+
+def validate_static_setup(root: Path, cfg: Dict[str, Any], arm: str) -> Dict[str, Any]:
+    acfg = arm_config(cfg, arm)
+    inventory = static_mcp_inventory(root)
+    mcp_list = claude_mcp_list(root)
+    expected = [normalize_server_name(x) for x in acfg.get("expected_mcp_servers", [])]
+    forbidden = [normalize_server_name(x) for x in acfg.get("forbidden_mcp_servers", [])]
+    missing = [s for s in expected if not server_present(s, inventory, mcp_list)]
+    forbidden_found = [s for s in forbidden if server_present(s, inventory, mcp_list)]
+    return {
+        "arm": arm,
+        "expected_mcp_servers": expected,
+        "forbidden_mcp_servers": forbidden,
+        "configured_inventory": inventory,
+        "claude_mcp_list": mcp_list,
+        "missing_expected": missing,
+        "forbidden_found": forbidden_found,
+        "static_pass": not missing and not forbidden_found,
+    }
+
+
+def build_claude_command(
+    cfg: Dict[str, Any],
+    acfg: Dict[str, Any],
+    prompt: str,
+    *,
+    model_key: str = "model",
+    max_turns: Optional[int] = None,
+    json_schema: Optional[Dict[str, Any]] = None,
+    bare: bool = False,
+) -> List[str]:
+    cmd = ["claude", "-p", prompt, "--output-format", "json"]
+    model = cfg.get(model_key) or cfg.get("model")
+    if model:
+        cmd.extend(["--model", str(model)])
+    mt = max_turns if max_turns is not None else cfg.get("max_turns")
+    if mt:
+        cmd.extend(["--max-turns", str(mt)])
+    max_budget = cfg.get("max_budget_usd")
+    if max_budget is not None:
+        cmd.extend(["--max-budget-usd", str(max_budget)])
+    permission_mode = cfg.get("permission_mode")
+    if permission_mode:
+        cmd.extend(["--permission-mode", str(permission_mode)])
+    allowed_tools = acfg.get("allowed_tools") or []
+    if allowed_tools:
+        # Claude Code accepts a comma-separated allow list in current releases.
+        cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+    if json_schema:
+        cmd.extend(["--json-schema", json.dumps(json_schema, separators=(",", ":"))])
+    if bare:
+        cmd.append("--bare")
+    extra_args = cfg.get("extra_claude_args") or []
+    if extra_args:
+        cmd.extend([str(x) for x in extra_args])
+    return cmd
+
+
+def parse_claude_output(stdout: str) -> Dict[str, Any]:
+    try:
+        return json.loads(stdout)
+    except Exception:
+        # Some failures produce non-JSON text. Keep it.
+        return {"type": "raw", "result": stdout, "parse_error": True}
+
+
+def claude_projects_root() -> Path:
+    return Path.home() / ".claude" / "projects"
+
+
+def find_transcript(session_id: Optional[str], cwd: Optional[Path] = None) -> Optional[Path]:
+    if not session_id:
+        return None
+    root = claude_projects_root()
+    if not root.exists():
+        return None
+    candidates = list(root.glob(f"**/{session_id}.jsonl"))
+    if candidates:
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+    # Fallback: scan recently modified files for sessionId.
+    all_jsonl = sorted(root.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:200]
+    needle = f'"sessionId":"{session_id}"'
+    needle_spaced = f'"sessionId": "{session_id}"'
+    for p in all_jsonl:
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+            if needle in text or needle_spaced in text:
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def iter_content_blocks(content: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                yield block
+    elif isinstance(content, dict):
+        yield content
+
+
+def server_from_tool_name(name: str) -> Optional[str]:
+    if not name:
+        return None
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        if len(parts) >= 3:
+            return normalize_server_name(parts[1])
+        if len(parts) >= 2:
+            return normalize_server_name(parts[1])
+    return None
+
+
+def parse_transcript(path: Optional[Path]) -> Dict[str, Any]:
+    totals: Dict[str, int] = defaultdict(int)
+    unknown_usage: Dict[str, int] = defaultdict(int)
+    models: Counter = Counter()
+    tool_calls: List[Dict[str, Any]] = []
+    assistant_turns = 0
+    user_turns = 0
+    errors = []
+    if path is None or not path.exists():
+        return {
+            "transcript_path": str(path) if path else None,
+            "found": False,
+            "usage": dict(totals),
+            "unknown_usage": dict(unknown_usage),
+            "models": {},
+            "tool_calls": [],
+            "tool_call_count": 0,
+            "mcp_tool_call_count": 0,
+            "mcp_servers_used": {},
+            "retrieval_attempted": False,
+            "assistant_turns": 0,
+            "user_turns": 0,
+            "errors": ["transcript not found"],
+        }
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception as e:
+                errors.append(f"line {line_no}: JSON parse error: {e}")
+                continue
+            typ = obj.get("type")
+            if typ == "assistant":
+                assistant_turns += 1
+                msg = obj.get("message") or {}
+                model = msg.get("model") or obj.get("model")
+                if model:
+                    models[str(model)] += 1
+                usage = msg.get("usage") or obj.get("usage") or {}
+                if isinstance(usage, dict):
+                    for k, v in usage.items():
+                        if isinstance(v, bool):
+                            continue
+                        if isinstance(v, (int, float)):
+                            if k in USAGE_KEYS:
+                                totals[k] += int(v)
+                            elif k.endswith("tokens") or "token" in k:
+                                unknown_usage[k] += int(v)
+                for block in iter_content_blocks(msg.get("content")):
+                    if block.get("type") == "tool_use":
+                        name = str(block.get("name") or "")
+                        server = server_from_tool_name(name)
+                        tool_calls.append({
+                            "line": line_no,
+                            "id": block.get("id"),
+                            "name": name,
+                            "server": server,
+                            "input_keys": sorted((block.get("input") or {}).keys()) if isinstance(block.get("input"), dict) else [],
+                        })
+            elif typ == "user":
+                user_turns += 1
+    mcp_servers = Counter(tc["server"] for tc in tool_calls if tc.get("server"))
+    return {
+        "transcript_path": str(path),
+        "found": True,
+        "usage": {k: int(totals.get(k, 0)) for k in USAGE_KEYS},
+        "unknown_usage": dict(unknown_usage),
+        "models": dict(models),
+        "tool_calls": tool_calls,
+        "tool_call_count": len(tool_calls),
+        "mcp_tool_call_count": sum(1 for tc in tool_calls if tc.get("server")),
+        "mcp_servers_used": dict(mcp_servers),
+        "retrieval_attempted": bool(tool_calls),
+        "assistant_turns": assistant_turns,
+        "user_turns": user_turns,
+        "errors": errors,
+    }
+
+
+def usage_total_tokens(usage: Dict[str, int]) -> int:
+    return sum(int(usage.get(k, 0)) for k in USAGE_KEYS)
+
+
+def cost_for_usage(cfg: Dict[str, Any], usage: Dict[str, int]) -> float:
+    rates = cfg.get("pricing_per_million") or {}
+    return sum((float(rates.get(k, 0.0)) * int(usage.get(k, 0)) / 1_000_000.0) for k in USAGE_KEYS)
+
+
+def run_claude_and_record(
+    root: Path,
+    cfg: Dict[str, Any],
+    acfg: Dict[str, Any],
+    prompt: str,
+    out_dir: Path,
+    *,
+    timeout: int,
+    model_key: str = "model",
+    max_turns: Optional[int] = None,
+    json_schema: Optional[Dict[str, Any]] = None,
+    bare: bool = False,
+) -> Dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_text(out_dir / "prompt.txt", prompt)
+    if shutil.which("claude") is None:
+        result = {
+            "started_at": now_iso(),
+            "returncode": 127,
+            "error": "claude CLI not found on PATH",
+            "claude_output": None,
+            "transcript": parse_transcript(None),
+        }
+        write_json(out_dir / "run.json", result)
+        return result
+    cmd = build_claude_command(cfg, acfg, prompt, model_key=model_key, max_turns=max_turns, json_schema=json_schema, bare=bare)
+    started_at = now_iso()
+    proc = run_subprocess(cmd, cwd=root, timeout=timeout)
+    write_text(out_dir / "stdout.txt", proc.get("stdout") or "")
+    write_text(out_dir / "stderr.txt", proc.get("stderr") or "")
+    write_json(out_dir / "command.json", {"cmd": cmd, "cwd": str(root), "started_at": started_at, "subprocess": proc})
+    parsed = parse_claude_output(proc.get("stdout") or "")
+    write_json(out_dir / "claude_output.json", parsed)
+    answer = parsed.get("result") or parsed.get("structured_output") or ""
+    if isinstance(answer, (dict, list)):
+        answer_text = json.dumps(answer, indent=2, sort_keys=True)
+    else:
+        answer_text = str(answer)
+    write_text(out_dir / "answer.md", answer_text)
+    session_id = parsed.get("session_id") or parsed.get("sessionId")
+    transcript_path = find_transcript(session_id, root)
+    transcript = parse_transcript(transcript_path)
+    usage = transcript.get("usage", {})
+    record = {
+        "started_at": started_at,
+        "completed_at": now_iso(),
+        "returncode": proc.get("returncode"),
+        "success": proc.get("returncode") == 0 and not parsed.get("is_error", False),
+        "session_id": session_id,
+        "claude_output_type": parsed.get("type"),
+        "claude_output_subtype": parsed.get("subtype"),
+        "total_cost_usd_reported_by_claude": parsed.get("total_cost_usd") or parsed.get("cost_usd"),
+        "duration_ms_reported_by_claude": parsed.get("duration_ms"),
+        "num_turns_reported_by_claude": parsed.get("num_turns"),
+        "transcript": transcript,
+        "usage": usage,
+        "total_tokens": usage_total_tokens(usage),
+        "computed_cost_usd": round(cost_for_usage(cfg, usage), 6),
+        "answer_path": str(out_dir / "answer.md"),
+        "raw_output_path": str(out_dir / "claude_output.json"),
+        "stderr_path": str(out_dir / "stderr.txt"),
+    }
+    write_json(out_dir / "run.json", record)
+    return record
+
+
+def command_preflight(args: argparse.Namespace) -> int:
+    config_path, cfg = load_config(args.config)
+    root = repo_root_for_config(config_path)
+    acfg = arm_config(cfg, args.arm)
+    out = results_dir(config_path, cfg) / "_preflight" / args.arm / slug_ts()
+    static = validate_static_setup(root, cfg, args.arm)
+    live_record = None
+    live_pass = None
+    if args.live:
+        prompt = acfg.get("preflight_prompt") or f"Use the {args.arm} retrieval tools once and report whether setup works."
+        live_record = run_claude_and_record(
+            root,
+            cfg,
+            acfg,
+            prompt,
+            out / "live",
+            timeout=int(cfg.get("preflight_timeout_seconds", 300)),
+            max_turns=int(cfg.get("preflight_max_turns", 6)),
+        )
+        observed = set((live_record.get("transcript") or {}).get("mcp_servers_used", {}).keys())
+        required = set(normalize_server_name(x) for x in acfg.get("require_live_tool_servers", acfg.get("expected_mcp_servers", [])))
+        # For live preflight, require successful run and at least some required retrieval evidence.
+        live_pass = bool(live_record.get("success")) and (not required or bool(observed & required))
+    overall_pass = bool(static.get("static_pass")) and (live_pass is not False)
+    record = {
+        "created_at": now_iso(),
+        "eval_name": cfg.get("eval_name"),
+        "arm": args.arm,
+        "static": static,
+        "live_enabled": bool(args.live),
+        "live_pass": live_pass,
+        "live_record": live_record,
+        "pass": overall_pass,
+    }
+    write_json(out / "preflight.json", record)
+    latest = results_dir(config_path, cfg) / "_preflight" / args.arm / "latest.json"
+    write_json(latest, record)
+    print(json.dumps({
+        "pass": overall_pass,
+        "preflight_path": str(out / "preflight.json"),
+        "missing_expected": static.get("missing_expected"),
+        "forbidden_found": static.get("forbidden_found"),
+        "live_pass": live_pass,
+    }, indent=2))
+    return 0 if overall_pass else 2
+
+
+def safe_prompt_id(prompt_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", prompt_id).strip("_") or "prompt"
+
+
+def command_run(args: argparse.Namespace) -> int:
+    config_path, cfg = load_config(args.config)
+    root = repo_root_for_config(config_path)
+    acfg = arm_config(cfg, args.arm)
+    prompts = load_prompts(config_path, cfg)
+    out_root = results_dir(config_path, cfg) / args.participant_id / args.arm
+    wrapper = cfg.get("prompt_wrapper") or "{prompt}"
+    manifest = {
+        "eval_name": cfg.get("eval_name"),
+        "participant_id": args.participant_id,
+        "arm": args.arm,
+        "started_at": now_iso(),
+        "prompt_count": len(prompts),
+        "runs": [],
+    }
+    failures = 0
+    for i, row in enumerate(prompts, 1):
+        pid = safe_prompt_id(row["ID"])
+        prompt_text = wrapper.format(prompt=row["Prompt"], id=row.get("ID", ""), dept=row.get("Dept", ""))
+        run_dir = out_root / pid
+        metadata = {
+            "id": row.get("ID"),
+            "dept": row.get("Dept", ""),
+            "prompt": row.get("Prompt", ""),
+            "arm": args.arm,
+            "participant_id": args.participant_id,
+            "ordinal": i,
+        }
+        write_json(run_dir / "metadata.json", metadata)
+        print(f"[{i}/{len(prompts)}] {args.arm} {pid}: running", flush=True)
+        rec = run_claude_and_record(
+            root,
+            cfg,
+            acfg,
+            prompt_text,
+            run_dir,
+            timeout=int(cfg.get("run_timeout_seconds", 1800)),
+        )
+        if not rec.get("success"):
+            failures += 1
+        manifest["runs"].append({
+            "id": row.get("ID"),
+            "dir": str(run_dir),
+            "success": rec.get("success"),
+            "session_id": rec.get("session_id"),
+            "total_tokens": rec.get("total_tokens"),
+            "computed_cost_usd": rec.get("computed_cost_usd"),
+            "retrieval_attempted": (rec.get("transcript") or {}).get("retrieval_attempted"),
+        })
+        print(
+            f"[{i}/{len(prompts)}] {args.arm} {pid}: "
+            f"success={rec.get('success')} tokens={rec.get('total_tokens')} "
+            f"retrieval={(rec.get('transcript') or {}).get('retrieval_attempted')}",
+            flush=True,
+        )
+    manifest["completed_at"] = now_iso()
+    manifest["failure_count"] = failures
+    write_json(out_root / "arm_manifest.json", manifest)
+    print(json.dumps({"participant_id": args.participant_id, "arm": args.arm, "runs": len(prompts), "failures": failures, "results_dir": str(out_root)}, indent=2))
+    return 0 if failures == 0 else 1
+
+
+def grade_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "winner": {"type": "string", "enum": ["glean", "direct", "tie"]},
+            "completeness_winner": {"type": "string", "enum": ["glean", "direct", "tie"]},
+            "groundedness_winner": {"type": "string", "enum": ["glean", "direct", "tie"]},
+            "usefulness_winner": {"type": "string", "enum": ["glean", "direct", "tie"]},
+            "efficiency_winner": {"type": "string", "enum": ["glean", "direct", "tie"]},
+            "completeness_glean": {"type": "number", "minimum": 1, "maximum": 5},
+            "completeness_direct": {"type": "number", "minimum": 1, "maximum": 5},
+            "groundedness_glean": {"type": "number", "minimum": 1, "maximum": 5},
+            "groundedness_direct": {"type": "number", "minimum": 1, "maximum": 5},
+            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            "reasoning": {"type": "string"},
+            "watchouts": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "winner",
+            "completeness_winner",
+            "groundedness_winner",
+            "usefulness_winner",
+            "efficiency_winner",
+            "completeness_glean",
+            "completeness_direct",
+            "groundedness_glean",
+            "groundedness_direct",
+            "confidence",
+            "reasoning",
+            "watchouts",
+        ],
+        "additionalProperties": True,
+    }
+
+
+def read_run(run_dir: Path) -> Optional[Dict[str, Any]]:
+    p = run_dir / "run.json"
+    if not p.exists():
+        return None
+    data = read_json(p)
+    meta = read_json(run_dir / "metadata.json") if (run_dir / "metadata.json").exists() else {}
+    answer = (run_dir / "answer.md").read_text(encoding="utf-8", errors="ignore") if (run_dir / "answer.md").exists() else ""
+    data["_dir"] = str(run_dir)
+    data["_metadata"] = meta
+    data["_answer"] = answer
+    return data
+
+
+def participant_dirs(res_dir: Path, participant_id: Optional[str]) -> List[Path]:
+    if participant_id:
+        p = res_dir / participant_id
+        return [p] if p.exists() else []
+    return sorted([p for p in res_dir.iterdir() if p.is_dir() and not p.name.startswith("_")]) if res_dir.exists() else []
+
+
+def paired_prompt_dirs(participant_dir: Path) -> List[Tuple[str, Path, Path]]:
+    glean = participant_dir / "glean"
+    direct = participant_dir / "direct"
+    if not glean.exists() or not direct.exists():
+        return []
+    ids = sorted({p.name for p in glean.iterdir() if p.is_dir()} & {p.name for p in direct.iterdir() if p.is_dir()})
+    return [(pid, glean / pid, direct / pid) for pid in ids]
+
+
+def judge_prompt(meta: Dict[str, Any], glean_run: Dict[str, Any], direct_run: Dict[str, Any]) -> str:
+    return textwrap.dedent(f"""
+    You are an evaluation judge for an A/B test comparing two Claude Code MCP configurations on enterprise knowledge tasks.
+
+    Compare the answers for one query. Judge quality first. Prefer lower token usage only when quality is materially similar. Do not reward a shorter answer if it is incomplete, vague, or unsupported.
+
+    Query ID: {meta.get('id')}
+    Department: {meta.get('dept')}
+    Query: {meta.get('prompt')}
+
+    Glean MCP answer tokens: {glean_run.get('total_tokens')}
+    Glean MCP answer:
+    {glean_run.get('_answer', '')}
+
+    Direct vendor MCP answer tokens: {direct_run.get('total_tokens')}
+    Direct vendor MCP answer:
+    {direct_run.get('_answer', '')}
+
+    Return the required JSON object only.
+    """).strip()
+
+
+def command_grade(args: argparse.Namespace) -> int:
+    config_path, cfg = load_config(args.config)
+    root = repo_root_for_config(config_path)
+    res = results_dir(config_path, cfg)
+    participants = participant_dirs(res, args.participant_id)
+    if not participants:
+        print("No participant result directories found", file=sys.stderr)
+        return 1
+    failures = 0
+    judge_acfg = {"allowed_tools": []}
+    for pdir in participants:
+        for pid, glean_dir, direct_dir in paired_prompt_dirs(pdir):
+            grade_path = pdir / "grades" / pid / "grade.json"
+            if grade_path.exists() and not args.force:
+                print(f"skip existing grade {pdir.name}/{pid}")
+                continue
+            glean_run = read_run(glean_dir)
+            direct_run = read_run(direct_dir)
+            if not glean_run or not direct_run:
+                continue
+            meta = glean_run.get("_metadata") or direct_run.get("_metadata") or {"id": pid}
+            prompt = judge_prompt(meta, glean_run, direct_run)
+            print(f"grading {pdir.name}/{pid}", flush=True)
+            rec = run_claude_and_record(
+                root,
+                cfg,
+                judge_acfg,
+                prompt,
+                grade_path.parent / "judge_run",
+                timeout=int(cfg.get("judge_timeout_seconds", 900)),
+                model_key="judge_model",
+                max_turns=int(cfg.get("judge_max_turns", 3)),
+                json_schema=grade_schema(),
+                bare=True,
+            )
+            raw = read_json(Path(rec["raw_output_path"])) if rec.get("raw_output_path") and Path(rec["raw_output_path"]).exists() else {}
+            grade = raw.get("structured_output")
+            if not grade and isinstance(raw.get("result"), str):
+                try:
+                    grade = json.loads(raw["result"])
+                except Exception:
+                    grade = None
+            if not isinstance(grade, dict):
+                failures += 1
+                grade = {"error": "judge did not return parseable structured output", "raw": raw}
+            grade_record = {
+                "created_at": now_iso(),
+                "participant_id": pdir.name,
+                "prompt_id": pid,
+                "query_id": meta.get("id", pid),
+                "judge_run_dir": str(grade_path.parent / "judge_run"),
+                "grade": grade,
+            }
+            write_json(grade_path, grade_record)
+    print(json.dumps({"participants": [p.name for p in participants], "grade_failures": failures}, indent=2))
+    return 0 if failures == 0 else 1
+
+
+def validity_flags(glean: Dict[str, Any], direct: Dict[str, Any]) -> List[str]:
+    flags = []
+    if not glean.get("success"):
+        flags.append("glean_run_failed")
+    if not direct.get("success"):
+        flags.append("direct_run_failed")
+    if not (glean.get("transcript") or {}).get("retrieval_attempted"):
+        flags.append("glean_no_retrieval")
+    if not (direct.get("transcript") or {}).get("retrieval_attempted"):
+        flags.append("direct_no_retrieval")
+    gm = set((glean.get("transcript") or {}).get("models", {}).keys())
+    dm = set((direct.get("transcript") or {}).get("models", {}).keys())
+    if gm and dm and gm != dm:
+        flags.append("model_mismatch")
+    return flags
+
+
+def collect_aggregate_rows(res: Path) -> List[Dict[str, Any]]:
+    rows = []
+    for pdir in participant_dirs(res, None):
+        for pid, glean_dir, direct_dir in paired_prompt_dirs(pdir):
+            glean = read_run(glean_dir)
+            direct = read_run(direct_dir)
+            if not glean or not direct:
+                continue
+            meta = glean.get("_metadata") or direct.get("_metadata") or {}
+            grade_path = pdir / "grades" / pid / "grade.json"
+            grade = read_json(grade_path).get("grade") if grade_path.exists() else {}
+            flags = validity_flags(glean, direct)
+            gt = int(glean.get("total_tokens") or 0)
+            dtok = int(direct.get("total_tokens") or 0)
+            gcost = float(glean.get("computed_cost_usd") or 0.0)
+            dcost = float(direct.get("computed_cost_usd") or 0.0)
+            g_usage = glean.get("usage") or {}
+            d_usage = direct.get("usage") or {}
+            g_marginal = int(g_usage.get("input_tokens", 0)) + int(g_usage.get("output_tokens", 0))
+            d_marginal = int(d_usage.get("input_tokens", 0)) + int(d_usage.get("output_tokens", 0))
+            g_rcost = float(glean.get("total_cost_usd_reported_by_claude") or 0.0)
+            d_rcost = float(direct.get("total_cost_usd_reported_by_claude") or 0.0)
+            g_lat = glean.get("duration_ms_reported_by_claude")
+            d_lat = direct.get("duration_ms_reported_by_claude")
+            rows.append({
+                "participant_id": pdir.name,
+                "prompt_dir_id": pid,
+                "query_id": meta.get("id", pid),
+                "dept": meta.get("dept", ""),
+                "prompt": meta.get("prompt", ""),
+                "glean_total_tokens": gt,
+                "direct_total_tokens": dtok,
+                "token_savings_pct": round((dtok - gt) / dtok * 100.0, 2) if dtok else "",
+                "glean_cost_usd": gcost,
+                "direct_cost_usd": dcost,
+                "cost_savings_pct": round((dcost - gcost) / dcost * 100.0, 2) if dcost else "",
+                "glean_reported_cost_usd": round(g_rcost, 6),
+                "direct_reported_cost_usd": round(d_rcost, 6),
+                "reported_cost_savings_pct": round((d_rcost - g_rcost) / d_rcost * 100.0, 2) if d_rcost else "",
+                "glean_marginal_tokens": g_marginal,
+                "direct_marginal_tokens": d_marginal,
+                "marginal_token_savings_pct": round((d_marginal - g_marginal) / d_marginal * 100.0, 2) if d_marginal else "",
+                "glean_latency_ms": g_lat if isinstance(g_lat, (int, float)) else "",
+                "direct_latency_ms": d_lat if isinstance(d_lat, (int, float)) else "",
+                "latency_savings_pct": round((d_lat - g_lat) / d_lat * 100.0, 2) if (isinstance(g_lat, (int, float)) and isinstance(d_lat, (int, float)) and d_lat) else "",
+                "glean_input_tokens": (glean.get("usage") or {}).get("input_tokens", 0),
+                "direct_input_tokens": (direct.get("usage") or {}).get("input_tokens", 0),
+                "glean_output_tokens": (glean.get("usage") or {}).get("output_tokens", 0),
+                "direct_output_tokens": (direct.get("usage") or {}).get("output_tokens", 0),
+                "glean_cache_write_tokens": (glean.get("usage") or {}).get("cache_creation_input_tokens", 0),
+                "direct_cache_write_tokens": (direct.get("usage") or {}).get("cache_creation_input_tokens", 0),
+                "glean_cache_read_tokens": (glean.get("usage") or {}).get("cache_read_input_tokens", 0),
+                "direct_cache_read_tokens": (direct.get("usage") or {}).get("cache_read_input_tokens", 0),
+                "glean_mcp_servers_used": json.dumps((glean.get("transcript") or {}).get("mcp_servers_used", {}), sort_keys=True),
+                "direct_mcp_servers_used": json.dumps((direct.get("transcript") or {}).get("mcp_servers_used", {}), sort_keys=True),
+                "validity_flags": ";".join(flags),
+                "valid": not flags,
+                "winner": grade.get("winner", "") if isinstance(grade, dict) else "",
+                "completeness_winner": grade.get("completeness_winner", "") if isinstance(grade, dict) else "",
+                "groundedness_winner": grade.get("groundedness_winner", "") if isinstance(grade, dict) else "",
+                "usefulness_winner": grade.get("usefulness_winner", "") if isinstance(grade, dict) else "",
+                "completeness_glean": grade.get("completeness_glean", "") if isinstance(grade, dict) else "",
+                "completeness_direct": grade.get("completeness_direct", "") if isinstance(grade, dict) else "",
+                "groundedness_glean": grade.get("groundedness_glean", "") if isinstance(grade, dict) else "",
+                "groundedness_direct": grade.get("groundedness_direct", "") if isinstance(grade, dict) else "",
+                "judge_confidence": grade.get("confidence", "") if isinstance(grade, dict) else "",
+                "judge_reasoning": grade.get("reasoning", "") if isinstance(grade, dict) else "",
+            })
+    return rows
+
+
+def mean(nums: Iterable[float]) -> float:
+    vals = [float(x) for x in nums]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def command_report(args: argparse.Namespace) -> int:
+    config_path, cfg = load_config(args.config)
+    res = results_dir(config_path, cfg)
+    res.mkdir(parents=True, exist_ok=True)
+    rows = collect_aggregate_rows(res)
+    csv_path = res / "aggregate_rows.csv"
+    if rows:
+        with csv_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+    else:
+        write_text(csv_path, "")
+    valid = [r for r in rows if r.get("valid")]
+    denom_rows = valid or rows
+
+    def col_mean(key: str) -> float:
+        return mean(float(r[key]) for r in denom_rows if r.get(key) not in ("", None))
+
+    def pct_lower(direct_val: float, glean_val: float) -> float:
+        return ((direct_val - glean_val) / direct_val * 100.0) if direct_val else 0.0
+
+    # Tokens: marginal = per-prompt work (input+output); fixed = per-session cache creation.
+    g_marg_avg = col_mean("glean_marginal_tokens")
+    d_marg_avg = col_mean("direct_marginal_tokens")
+    g_fixed_avg = col_mean("glean_cache_write_tokens")
+    d_fixed_avg = col_mean("direct_cache_write_tokens")
+    gt_avg = col_mean("glean_total_tokens")
+    dt_avg = col_mean("direct_total_tokens")
+    # Cost: reported = Claude Code's own per-run figure (primary); list = normalized rate card.
+    g_rc_avg = col_mean("glean_reported_cost_usd")
+    d_rc_avg = col_mean("direct_reported_cost_usd")
+    gc_avg = col_mean("glean_cost_usd")
+    dc_avg = col_mean("direct_cost_usd")
+    # Latency: wall-clock milliseconds reported by Claude Code.
+    g_lat_avg = col_mean("glean_latency_ms")
+    d_lat_avg = col_mean("direct_latency_ms")
+
+    winner_counts = Counter(r.get("winner") or "ungraded" for r in denom_rows)
+    comp_g = col_mean("completeness_glean")
+    comp_d = col_mean("completeness_direct")
+    gr_g = col_mean("groundedness_glean")
+    gr_d = col_mean("groundedness_direct")
+
+    marginal_savings = pct_lower(d_marg_avg, g_marg_avg)
+    total_token_savings = pct_lower(dt_avg, gt_avg)
+    reported_cost_savings = pct_lower(d_rc_avg, g_rc_avg)
+    list_cost_savings = pct_lower(dc_avg, gc_avg)
+    latency_savings = pct_lower(d_lat_avg, g_lat_avg)
+    invalid_count = len(rows) - len(valid)
+    md = f"""# Aggregate summary
+
+Generated: {now_iso()}
+
+Eval: `{cfg.get('eval_name', '')}`
+
+## Dataset
+
+- Paired rows: {len(rows)}
+- Valid rows: {len(valid)}
+- Invalid / flagged rows: {invalid_count}
+- Summary basis: {'valid rows' if valid else 'all rows (no fully valid rows found)'}
+
+## Cost
+
+Primary metric is the cost Claude Code reports per run. List-price-normalized cost applies the configurable `pricing_per_million` rates uniformly across both arms.
+
+| Metric | Glean MCP | Direct MCP | Delta |
+|---|---:|---:|---:|
+| Avg reported cost / task | ${g_rc_avg:,.4f} | ${d_rc_avg:,.4f} | {reported_cost_savings:.1f}% lower for Glean |
+| Avg list-price-normalized cost / task | ${gc_avg:,.4f} | ${dc_avg:,.4f} | {list_cost_savings:.1f}% lower for Glean |
+
+> List-price-normalized cost is a rate-card comparison, not billed spend. Verify `pricing_per_million` against current model list prices; it can diverge sharply from reported cost when cache-creation tokens dominate.
+
+## Tokens
+
+Marginal = per-prompt work (input + output). Fixed = per-session cache creation (schema/context loaded on each fresh session, largely identical across arms and so mostly cancelling in the delta). Cache-read tokens are in the per-row CSV.
+
+| Metric | Glean MCP | Direct MCP | Delta |
+|---|---:|---:|---:|
+| Avg marginal tokens / task | {g_marg_avg:,.0f} | {d_marg_avg:,.0f} | {marginal_savings:.1f}% lower for Glean |
+| Avg fixed (cache-creation) tokens / task | {g_fixed_avg:,.0f} | {d_fixed_avg:,.0f} | — |
+| Avg total tokens / task | {gt_avg:,.0f} | {dt_avg:,.0f} | {total_token_savings:.1f}% lower for Glean |
+
+> Prefer marginal tokens + reported cost for headline claims. Raw totals are dominated by per-session cache creation and can mislead.
+
+## Latency
+
+| Metric | Glean MCP | Direct MCP | Delta |
+|---|---:|---:|---:|
+| Avg wall-clock / task | {g_lat_avg / 1000:,.1f}s | {d_lat_avg / 1000:,.1f}s | {latency_savings:.1f}% faster for Glean |
+
+## Quality judge summary
+
+| Metric | Glean MCP | Direct MCP |
+|---|---:|---:|
+| Avg completeness | {comp_g:.2f} | {comp_d:.2f} |
+| Avg groundedness | {gr_g:.2f} | {gr_d:.2f} |
+
+Winner counts: `{dict(winner_counts)}`
+
+## Validity notes
+
+Rows with any of these flags should be reviewed/excluded before executive claims:
+
+- `glean_run_failed`
+- `direct_run_failed`
+- `glean_no_retrieval`
+- `direct_no_retrieval`
+- `model_mismatch`
+
+Detailed rows: [`aggregate_rows.csv`](aggregate_rows.csv)
+"""
+    summary_path = res / "aggregate_summary.md"
+    write_text(summary_path, md)
+    print(json.dumps({
+        "rows": len(rows),
+        "valid_rows": len(valid),
+        "aggregate_rows_csv": str(csv_path),
+        "aggregate_summary_md": str(summary_path),
+        "avg_marginal_token_savings_pct": round(marginal_savings, 2),
+        "avg_total_token_savings_pct": round(total_token_savings, 2),
+        "avg_reported_cost_savings_pct": round(reported_cost_savings, 2),
+        "avg_list_cost_savings_pct": round(list_cost_savings, 2),
+        "avg_latency_savings_pct": round(latency_savings, 2),
+    }, indent=2))
+    return 0
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def command_package(args: argparse.Namespace) -> int:
+    config_path, cfg = load_config(args.config)
+    res = results_dir(config_path, cfg)
+    if not res.exists():
+        raise EvalError(f"Results dir not found: {res}")
+    manifest_path = res / "submission_manifest.json"
+    zip_path = res / "eval_submission.zip"
+    files = []
+    for p in sorted(res.rglob("*")):
+        if not p.is_file():
+            continue
+        if p == zip_path:
+            continue
+        rel = p.relative_to(res).as_posix()
+        files.append({"path": rel, "sha256": sha256_file(p), "bytes": p.stat().st_size})
+    manifest = {
+        "created_at": now_iso(),
+        "eval_name": cfg.get("eval_name"),
+        "results_dir": str(res),
+        "file_count": len(files),
+        "files": files,
+    }
+    write_json(manifest_path, manifest)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for entry in files:
+            p = res / entry["path"]
+            zf.write(p, arcname=entry["path"])
+        zf.write(manifest_path, arcname="submission_manifest.json")
+    print(json.dumps({"manifest": str(manifest_path), "zip": str(zip_path), "file_count": len(files)}, indent=2))
+    return 0
+
+
+def safe_extract_zip(zip_path: Path, dest: Path) -> None:
+    """Extract zip_path to dest, rejecting path traversal entries."""
+    dest_resolved = dest.resolve()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            target = (dest / member.filename).resolve()
+            if not str(target).startswith(str(dest_resolved) + os.sep) and target != dest_resolved:
+                raise EvalError(f"Unsafe zip entry path: {member.filename}")
+        zf.extractall(dest)
+
+
+def command_import(args: argparse.Namespace) -> int:
+    config_path, cfg = load_config(args.config)
+    res = results_dir(config_path, cfg)
+    res.mkdir(parents=True, exist_ok=True)
+    imported = []
+    skipped = []
+    for zip_arg in args.zips:
+        zip_path = Path(zip_arg).expanduser().resolve()
+        if not zip_path.exists():
+            raise EvalError(f"Submission zip not found: {zip_path}")
+        with tempfile.TemporaryDirectory(prefix="glean-mcp-eval-import-") as td:
+            tmp = Path(td)
+            safe_extract_zip(zip_path, tmp)
+            top_dirs = [p for p in tmp.iterdir() if p.is_dir() and not p.name.startswith("_")]
+            # Participant dirs contain at least one arm directory. Ignore docs/metadata-only dirs.
+            participant_dirs_found = [
+                p for p in top_dirs
+                if (p / "glean").exists() or (p / "direct").exists() or (p / "grades").exists()
+            ]
+            if args.participant_id:
+                participant_dirs_found = [p for p in participant_dirs_found if p.name == args.participant_id]
+            if not participant_dirs_found:
+                skipped.append({"zip": str(zip_path), "reason": "no participant result directories found"})
+                continue
+            for src in participant_dirs_found:
+                dst = res / src.name
+                if dst.exists() and not args.replace:
+                    skipped.append({"zip": str(zip_path), "participant_id": src.name, "reason": "already exists; use --replace to overwrite"})
+                    continue
+                if dst.exists():
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+                imported.append({"zip": str(zip_path), "participant_id": src.name, "destination": str(dst)})
+    print(json.dumps({"imported": imported, "skipped": skipped, "results_dir": str(res)}, indent=2))
+    return 0 if imported or not skipped else 1
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    config_path, cfg = load_config(args.config)
+    root = repo_root_for_config(config_path)
+    data = {
+        "created_at": now_iso(),
+        "root": str(root),
+        "claude_on_path": shutil.which("claude"),
+        "static_mcp_inventory": static_mcp_inventory(root),
+        "claude_mcp_list": claude_mcp_list(root),
+        "prompts_count": len(load_prompts(config_path, cfg)),
+        "results_dir": str(results_dir(config_path, cfg)),
+    }
+    print(json.dumps(data, indent=2))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Run and analyze Glean MCP A/B evaluations in Claude Code.")
+    p.add_argument("--version", action="version", version="glean-mcp-eval 0.1.0")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    def add_config(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--config", default=DEFAULT_CONFIG, help="Path to eval config JSON")
+
+    sp = sub.add_parser("doctor", help="Inspect local config and Claude/MCP availability")
+    add_config(sp)
+    sp.set_defaults(func=command_doctor)
+
+    sp = sub.add_parser("preflight", help="Validate setup for one arm")
+    add_config(sp)
+    sp.add_argument("--arm", required=True, help="Arm name from config, e.g. glean or direct")
+    sp.add_argument("--live", action="store_true", help="Run live Claude Code preflight probe")
+    sp.set_defaults(func=command_preflight)
+
+    sp = sub.add_parser("run", help="Run all prompts for one participant/arm")
+    add_config(sp)
+    sp.add_argument("--arm", required=True, help="Arm name from config, e.g. glean or direct")
+    sp.add_argument("--participant-id", required=True, help="Stable anonymous participant ID")
+    sp.set_defaults(func=command_run)
+
+    sp = sub.add_parser("grade", help="Judge paired Glean/direct answers")
+    add_config(sp)
+    sp.add_argument("--participant-id", help="Participant ID to grade; omit for all")
+    sp.add_argument("--force", action="store_true", help="Regenerate existing grades")
+    sp.set_defaults(func=command_grade)
+
+    sp = sub.add_parser("report", help="Aggregate paired results into CSV and Markdown")
+    add_config(sp)
+    sp.set_defaults(func=command_report)
+
+    sp = sub.add_parser("package", help="Create checksum manifest and submission zip")
+    add_config(sp)
+    sp.set_defaults(func=command_package)
+
+    sp = sub.add_parser("import", help="Import participant submission zip(s) into this results directory")
+    add_config(sp)
+    sp.add_argument("zips", nargs="+", help="One or more eval_submission.zip files from participants")
+    sp.add_argument("--participant-id", help="Only import this participant ID from each zip")
+    sp.add_argument("--replace", action="store_true", help="Replace existing participant results with imported results")
+    sp.set_defaults(func=command_import)
+
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except EvalError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("Interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

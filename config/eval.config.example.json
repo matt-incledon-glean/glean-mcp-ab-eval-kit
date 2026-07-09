@@ -1,0 +1,33 @@
+{
+  "eval_name": "customer-glean-mcp-ab-eval",
+  "prompts_file": "golden_prompts.tsv",
+  "results_dir": "results",
+  "model": "opus",
+  "judge_model": "opus",
+  "max_turns": 12,
+  "prompt_wrapper": "Answer the following enterprise knowledge question. Use the configured retrieval tools to find current, grounded sources. Cite source names/URLs when available. If you cannot find enough evidence, say what is missing.\n\nQuestion:\n{prompt}",
+  "preflight_timeout_seconds": 300,
+  "run_timeout_seconds": 1800,
+  "pricing_per_million": {
+    "input_tokens": 15.0,
+    "output_tokens": 75.0,
+    "cache_creation_input_tokens": 18.75,
+    "cache_read_input_tokens": 1.5
+  },
+  "arms": {
+    "glean": {
+      "label": "Glean MCP",
+      "expected_mcp_servers": ["glean"],
+      "forbidden_mcp_servers": ["slack", "jira", "atlassian", "microsoft", "teams", "outlook", "asana", "zoom"],
+      "allowed_tools": ["mcp__glean"],
+      "preflight_prompt": "Use the Glean MCP tools to perform a harmless search for the company name and return a one sentence confirmation that retrieval worked."
+    },
+    "direct": {
+      "label": "Direct vendor MCPs",
+      "expected_mcp_servers": ["slack", "jira", "microsoft", "asana", "zoom"],
+      "forbidden_mcp_servers": ["glean"],
+      "allowed_tools": ["mcp__slack", "mcp__jira", "mcp__microsoft", "mcp__asana", "mcp__zoom"],
+      "preflight_prompt": "Use each configured vendor MCP at least once in a harmless read-only way: Slack, Jira/Atlassian, Microsoft, Asana, and Zoom. Return a compact pass/fail table."
+    }
+  }
+}

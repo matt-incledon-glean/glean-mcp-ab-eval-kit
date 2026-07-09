@@ -1,0 +1,21 @@
+[project]
+name = "glean-mcp-ab-eval-kit"
+version = "0.1.0"
+description = "A/B evaluation kit for Glean MCP vs direct vendor MCPs in Claude Code"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Glean" }]
+keywords = ["glean", "mcp", "claude-code", "evaluation", "tokens"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+]
+dependencies = []
+
+[project.scripts]
+glean-mcp-eval = "glean_mcp_eval:main"
+
+[tool.setuptools]
+py-modules = ["glean_mcp_eval"]
+package-dir = { "" = "scripts" }

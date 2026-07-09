@@ -1,0 +1,23 @@
+{
+  "name": "glean-mcp-eval",
+  "version": "0.1.0",
+  "description": "Run a crossover A/B evaluation of Glean MCP vs direct vendor MCPs in Claude Code.",
+  "author": "Glean",
+  "commands": [
+    {
+      "name": "preflight",
+      "description": "Validate the current MCP arm setup before running prompts.",
+      "path": "commands/preflight.md"
+    },
+    {
+      "name": "run-arm",
+      "description": "Run all golden prompts for one configured arm in isolated Claude Code sessions.",
+      "path": "commands/run-arm.md"
+    },
+    {
+      "name": "grade-report-package",
+      "description": "Grade paired answers, aggregate results, and package a tamper-evident submission zip.",
+      "path": "commands/grade-report-package.md"
+    }
+  ]
+}

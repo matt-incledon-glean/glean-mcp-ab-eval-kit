@@ -1,0 +1,28 @@
+# Local/customer-specific working files
+eval.config.json
+golden_prompts.tsv
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Packaging/build
+build/
+dist/
+*.egg-info/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Claude local/session-specific settings
+.claude/settings.local.json
+
+# Archives that may contain customer data
+*.zip

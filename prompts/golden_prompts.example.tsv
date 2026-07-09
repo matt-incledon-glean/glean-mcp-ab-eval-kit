@@ -1,0 +1,6 @@
+ID	Dept	Prompt
+ENG_001	Engineering	Summarize the current status of [PROJECT_NAME] across tickets, docs, and team messages. Include owners, risks, and next steps.
+IT_001	IT/Security	Summarize the company's access management policy. Who approves sensitive access, what are the rules for service credentials, and when was it last updated?
+HR_001	HR/People Ops	What is the current PTO policy for [EMPLOYEE_GROUP]? Does PTO accrue, carry over, or pay out at termination, and what approvals are required for long absences?
+SALES_001	Sales/Revenue	Find the latest discussion about [REVENUE_PIPELINE_OR_TABLE]. What issue was reported, what was the impact, and has it been fixed?
+FIN_001	Finance/Ops	What changed in the latest release of [FINANCE_SYSTEM_OR_PROCESS], and what problem does it solve for finance stakeholders?

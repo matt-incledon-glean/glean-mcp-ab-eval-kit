@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+ROOT_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+exec python3 "$ROOT_DIR/scripts/glean_mcp_eval.py" "$@"
