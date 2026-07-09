@@ -25,8 +25,6 @@ bin/glean-mcp-eval              Shell wrapper for zip installs
 config/eval.config.example.json Example customer config
 prompts/golden_prompts.example.tsv
                               Prompt TSV schema + safe sample prompts
-docs/REVERSE_ENGINEERED_DESIGN.md
-                              Sanitized reconstruction of the pilot design
 docs/METHODOLOGY.md             Evaluation design and caveats
 docs/CONNECTOR_HEALTH_CHECKLIST.md
                               Daily connector health process
