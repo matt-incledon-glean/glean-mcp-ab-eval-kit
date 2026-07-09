@@ -239,10 +239,32 @@ def server_present(server: str, inventory: Dict[str, Any], mcp_list: Dict[str, A
     return s in static or s in hinted or bool(s and s in raw)
 
 
+def inventory_from_file(path: Path) -> Dict[str, Any]:
+    counts: Counter = Counter()
+    errors = []
+    if not path.exists():
+        errors.append({"path": str(path), "error": "mcp_config file not found"})
+        return {"servers": [], "files": [], "errors": errors}
+    try:
+        recursively_find_mcp_servers(read_json(path), counts)
+    except Exception as e:  # noqa: BLE001 - report, don't fail.
+        errors.append({"path": str(path), "error": str(e)})
+    servers = sorted(counts.keys())
+    return {"servers": servers, "files": [{"path": str(path), "servers_found": servers}], "errors": errors}
+
+
 def validate_static_setup(root: Path, cfg: Dict[str, Any], arm: str) -> Dict[str, Any]:
     acfg = arm_config(cfg, arm)
-    inventory = static_mcp_inventory(root)
-    mcp_list = claude_mcp_list(root)
+    mcp_config_path = resolve_mcp_config(root, acfg)
+    if mcp_config_path is not None:
+        # Strict per-arm isolation: at runtime the arm uses --strict-mcp-config,
+        # so the only servers that exist are those in this file. Validate against
+        # the file, not the ambient config (which would include the other arm's).
+        inventory = inventory_from_file(mcp_config_path)
+        mcp_list = {"available": None, "strict_mode": True, "mcp_config": str(mcp_config_path), "servers_hint": [], "raw": None}
+    else:
+        inventory = static_mcp_inventory(root)
+        mcp_list = claude_mcp_list(root)
     expected = [normalize_server_name(x) for x in acfg.get("expected_mcp_servers", [])]
     forbidden = [normalize_server_name(x) for x in acfg.get("forbidden_mcp_servers", [])]
     missing = [s for s in expected if not server_present(s, inventory, mcp_list)]
@@ -259,7 +281,18 @@ def validate_static_setup(root: Path, cfg: Dict[str, Any], arm: str) -> Dict[str
     }
 
 
+def resolve_mcp_config(root: Path, acfg: Dict[str, Any]) -> Optional[Path]:
+    mcp_config = acfg.get("mcp_config")
+    if not mcp_config:
+        return None
+    p = Path(mcp_config)
+    if not p.is_absolute():
+        p = root / p
+    return p
+
+
 def build_claude_command(
+    root: Path,
     cfg: Dict[str, Any],
     acfg: Dict[str, Any],
     prompt: str,
@@ -282,6 +315,11 @@ def build_claude_command(
     permission_mode = cfg.get("permission_mode")
     if permission_mode:
         cmd.extend(["--permission-mode", str(permission_mode)])
+    mcp_config_path = resolve_mcp_config(root, acfg)
+    if mcp_config_path is not None:
+        # Load ONLY this arm's servers and ignore any ambient/global MCP config,
+        # so the arms are provably isolated regardless of what else is installed.
+        cmd.extend(["--mcp-config", str(mcp_config_path), "--strict-mcp-config"])
     allowed_tools = acfg.get("allowed_tools") or []
     if allowed_tools:
         # Claude Code accepts a comma-separated allow list in current releases.
@@ -468,7 +506,7 @@ def run_claude_and_record(
         }
         write_json(out_dir / "run.json", result)
         return result
-    cmd = build_claude_command(cfg, acfg, prompt, model_key=model_key, max_turns=max_turns, json_schema=json_schema, bare=bare)
+    cmd = build_claude_command(root, cfg, acfg, prompt, model_key=model_key, max_turns=max_turns, json_schema=json_schema, bare=bare)
     started_at = now_iso()
     proc = run_subprocess(cmd, cwd=root, timeout=timeout)
     write_text(out_dir / "stdout.txt", proc.get("stdout") or "")
