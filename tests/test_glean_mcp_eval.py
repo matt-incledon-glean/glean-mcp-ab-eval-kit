@@ -116,5 +116,46 @@ class ReportTest(unittest.TestCase):
             self.assertTrue((root / "results" / "customer01" / "glean" / "Q1" / "run.json").exists())
 
 
+class BlindGradingTest(unittest.TestCase):
+    def test_blind_assignment_deterministic(self):
+        # Same inputs → same label every time (auditable / reproducible regrades).
+        first = gme.blind_assignment("user01", "Q1")
+        second = gme.blind_assignment("user01", "Q1")
+        self.assertEqual(first, second)
+        self.assertIsInstance(first, bool)
+
+    def test_deblind_when_glean_is_a(self):
+        blind = {
+            "winner": "A",
+            "completeness_winner": "B",
+            "groundedness_winner": "tie",
+            "completeness_a": 4, "completeness_b": 2,
+            "groundedness_a": 5, "groundedness_b": 3,
+            "confidence": "high", "reasoning": "x",
+        }
+        g = gme.deblind_grade(blind, glean_is_a=True)
+        self.assertEqual(g["winner"], "glean")
+        self.assertEqual(g["completeness_winner"], "direct")
+        self.assertEqual(g["groundedness_winner"], "tie")
+        self.assertEqual(g["completeness_glean"], 4)
+        self.assertEqual(g["completeness_direct"], 2)
+        self.assertEqual(g["groundedness_glean"], 5)
+        self.assertEqual(g["confidence"], "high")
+
+    def test_deblind_when_glean_is_b(self):
+        # Glean shown as B: an "A" win must de-blind to direct.
+        blind = {
+            "winner": "A",
+            "completeness_a": 4, "completeness_b": 2,
+            "groundedness_a": 5, "groundedness_b": 3,
+        }
+        g = gme.deblind_grade(blind, glean_is_a=False)
+        self.assertEqual(g["winner"], "direct")
+        self.assertEqual(g["completeness_glean"], 2)
+        self.assertEqual(g["completeness_direct"], 4)
+        self.assertEqual(g["groundedness_glean"], 3)
+        self.assertEqual(g["groundedness_direct"], 5)
+
+
 if __name__ == "__main__":
     unittest.main()

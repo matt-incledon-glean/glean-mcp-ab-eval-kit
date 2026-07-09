@@ -623,18 +623,20 @@ def command_run(args: argparse.Namespace) -> int:
 
 
 def grade_schema() -> Dict[str, Any]:
+    # Blind schema: the judge sees "Answer A" / "Answer B" and is never told which
+    # arm is Glean. Results are de-blinded back to glean/direct after grading.
     return {
         "type": "object",
         "properties": {
-            "winner": {"type": "string", "enum": ["glean", "direct", "tie"]},
-            "completeness_winner": {"type": "string", "enum": ["glean", "direct", "tie"]},
-            "groundedness_winner": {"type": "string", "enum": ["glean", "direct", "tie"]},
-            "usefulness_winner": {"type": "string", "enum": ["glean", "direct", "tie"]},
-            "efficiency_winner": {"type": "string", "enum": ["glean", "direct", "tie"]},
-            "completeness_glean": {"type": "number", "minimum": 1, "maximum": 5},
-            "completeness_direct": {"type": "number", "minimum": 1, "maximum": 5},
-            "groundedness_glean": {"type": "number", "minimum": 1, "maximum": 5},
-            "groundedness_direct": {"type": "number", "minimum": 1, "maximum": 5},
+            "winner": {"type": "string", "enum": ["A", "B", "tie"]},
+            "completeness_winner": {"type": "string", "enum": ["A", "B", "tie"]},
+            "groundedness_winner": {"type": "string", "enum": ["A", "B", "tie"]},
+            "usefulness_winner": {"type": "string", "enum": ["A", "B", "tie"]},
+            "efficiency_winner": {"type": "string", "enum": ["A", "B", "tie"]},
+            "completeness_a": {"type": "number", "minimum": 1, "maximum": 5},
+            "completeness_b": {"type": "number", "minimum": 1, "maximum": 5},
+            "groundedness_a": {"type": "number", "minimum": 1, "maximum": 5},
+            "groundedness_b": {"type": "number", "minimum": 1, "maximum": 5},
             "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
             "reasoning": {"type": "string"},
             "watchouts": {"type": "array", "items": {"type": "string"}},
@@ -645,16 +647,52 @@ def grade_schema() -> Dict[str, Any]:
             "groundedness_winner",
             "usefulness_winner",
             "efficiency_winner",
-            "completeness_glean",
-            "completeness_direct",
-            "groundedness_glean",
-            "groundedness_direct",
+            "completeness_a",
+            "completeness_b",
+            "groundedness_a",
+            "groundedness_b",
             "confidence",
             "reasoning",
             "watchouts",
         ],
         "additionalProperties": True,
     }
+
+
+def blind_assignment(participant_id: str, prompt_id: str) -> bool:
+    # Deterministic, auditable A/B coin flip. Returns True when Glean is presented
+    # as "Answer A". Stable across reruns so a regrade reproduces the same layout.
+    h = hashlib.sha256(f"{participant_id}/{prompt_id}".encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % 2 == 0
+
+
+def deblind_grade(bg: Dict[str, Any], glean_is_a: bool) -> Dict[str, Any]:
+    # Translate an A/B judge result back into glean/direct keys so downstream
+    # aggregation (collect_aggregate_rows) is unchanged.
+    if not isinstance(bg, dict):
+        return bg
+
+    def ab_to_arm(v: Any) -> Any:
+        if v == "A":
+            return "glean" if glean_is_a else "direct"
+        if v == "B":
+            return "direct" if glean_is_a else "glean"
+        return v
+
+    out: Dict[str, Any] = {}
+    for wk in ("winner", "completeness_winner", "groundedness_winner", "usefulness_winner", "efficiency_winner"):
+        if wk in bg:
+            out[wk] = ab_to_arm(bg.get(wk))
+    if "completeness_a" in bg or "completeness_b" in bg:
+        out["completeness_glean"] = bg.get("completeness_a") if glean_is_a else bg.get("completeness_b")
+        out["completeness_direct"] = bg.get("completeness_b") if glean_is_a else bg.get("completeness_a")
+    if "groundedness_a" in bg or "groundedness_b" in bg:
+        out["groundedness_glean"] = bg.get("groundedness_a") if glean_is_a else bg.get("groundedness_b")
+        out["groundedness_direct"] = bg.get("groundedness_b") if glean_is_a else bg.get("groundedness_a")
+    for pk in ("confidence", "reasoning", "watchouts"):
+        if pk in bg:
+            out[pk] = bg.get(pk)
+    return out
 
 
 def read_run(run_dir: Path) -> Optional[Dict[str, Any]]:
@@ -686,25 +724,35 @@ def paired_prompt_dirs(participant_dir: Path) -> List[Tuple[str, Path, Path]]:
     return [(pid, glean / pid, direct / pid) for pid in ids]
 
 
-def judge_prompt(meta: Dict[str, Any], glean_run: Dict[str, Any], direct_run: Dict[str, Any]) -> str:
-    return textwrap.dedent(f"""
-    You are an evaluation judge for an A/B test comparing two Claude Code MCP configurations on enterprise knowledge tasks.
+def marginal_tokens(run: Dict[str, Any]) -> int:
+    u = run.get("usage") or {}
+    return int(u.get("input_tokens", 0)) + int(u.get("output_tokens", 0))
 
-    Compare the answers for one query. Judge quality first. Prefer lower token usage only when quality is materially similar. Do not reward a shorter answer if it is incomplete, vague, or unsupported.
+
+def judge_prompt(meta: Dict[str, Any], run_a: Dict[str, Any], run_b: Dict[str, Any]) -> str:
+    return textwrap.dedent(f"""
+    You are an impartial evaluation judge for an A/B test comparing two assistant
+    configurations on enterprise knowledge tasks. You are NOT told which system
+    produced which answer; judge only on the merits.
+
+    Compare the two answers for one query. Judge quality first (completeness,
+    groundedness, usefulness). Prefer lower token usage only when quality is
+    materially similar. Do not reward a shorter answer if it is incomplete, vague,
+    or unsupported.
 
     Query ID: {meta.get('id')}
     Department: {meta.get('dept')}
     Query: {meta.get('prompt')}
 
-    Glean MCP answer tokens: {glean_run.get('total_tokens')}
-    Glean MCP answer:
-    {glean_run.get('_answer', '')}
+    Answer A work tokens (input+output): {marginal_tokens(run_a)}
+    Answer A:
+    {run_a.get('_answer', '')}
 
-    Direct vendor MCP answer tokens: {direct_run.get('total_tokens')}
-    Direct vendor MCP answer:
-    {direct_run.get('_answer', '')}
+    Answer B work tokens (input+output): {marginal_tokens(run_b)}
+    Answer B:
+    {run_b.get('_answer', '')}
 
-    Return the required JSON object only.
+    Return the required JSON object only, using "A", "B", or "tie" for the winner fields.
     """).strip()
 
 
@@ -729,8 +777,10 @@ def command_grade(args: argparse.Namespace) -> int:
             if not glean_run or not direct_run:
                 continue
             meta = glean_run.get("_metadata") or direct_run.get("_metadata") or {"id": pid}
-            prompt = judge_prompt(meta, glean_run, direct_run)
-            print(f"grading {pdir.name}/{pid}", flush=True)
+            glean_is_a = blind_assignment(pdir.name, pid)
+            run_a, run_b = (glean_run, direct_run) if glean_is_a else (direct_run, glean_run)
+            prompt = judge_prompt(meta, run_a, run_b)
+            print(f"grading {pdir.name}/{pid} (glean shown as {'A' if glean_is_a else 'B'})", flush=True)
             rec = run_claude_and_record(
                 root,
                 cfg,
@@ -744,21 +794,26 @@ def command_grade(args: argparse.Namespace) -> int:
                 bare=True,
             )
             raw = read_json(Path(rec["raw_output_path"])) if rec.get("raw_output_path") and Path(rec["raw_output_path"]).exists() else {}
-            grade = raw.get("structured_output")
-            if not grade and isinstance(raw.get("result"), str):
+            blind_grade = raw.get("structured_output")
+            if not blind_grade and isinstance(raw.get("result"), str):
                 try:
-                    grade = json.loads(raw["result"])
+                    blind_grade = json.loads(raw["result"])
                 except Exception:
-                    grade = None
-            if not isinstance(grade, dict):
+                    blind_grade = None
+            if not isinstance(blind_grade, dict):
                 failures += 1
+                blind_grade = None
                 grade = {"error": "judge did not return parseable structured output", "raw": raw}
+            else:
+                grade = deblind_grade(blind_grade, glean_is_a)
             grade_record = {
                 "created_at": now_iso(),
                 "participant_id": pdir.name,
                 "prompt_id": pid,
                 "query_id": meta.get("id", pid),
                 "judge_run_dir": str(grade_path.parent / "judge_run"),
+                "blind_assignment": {"glean_label": "A" if glean_is_a else "B", "direct_label": "B" if glean_is_a else "A"},
+                "blind_grade": blind_grade,
                 "grade": grade,
             }
             write_json(grade_path, grade_record)
