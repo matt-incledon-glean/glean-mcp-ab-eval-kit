@@ -324,6 +324,12 @@ def build_claude_command(
     if allowed_tools:
         # Claude Code accepts a comma-separated allow list in current releases.
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+    disallowed_tools = acfg.get("disallowed_tools") or []
+    if disallowed_tools:
+        # Deny rules take precedence over allow rules — a hard block for
+        # write-capable and arbitrary-dispatch tools (e.g. Glean's run_tool)
+        # even if the allow-list is later widened or a server-level grant is used.
+        cmd.extend(["--disallowedTools", ",".join(disallowed_tools)])
     if json_schema:
         cmd.extend(["--json-schema", json.dumps(json_schema, separators=(",", ":"))])
     if bare:
@@ -829,7 +835,9 @@ def command_grade(args: argparse.Namespace) -> int:
                 model_key="judge_model",
                 max_turns=int(cfg.get("judge_max_turns", 3)),
                 json_schema=grade_schema(),
-                bare=True,
+                # Do NOT pass bare=True: --bare skips the plugin/settings that
+                # inject Glean LLM Gateway auth, so the judge fails with
+                # "Not logged in". The judge only needs to emit structured JSON.
             )
             raw = read_json(Path(rec["raw_output_path"])) if rec.get("raw_output_path") and Path(rec["raw_output_path"]).exists() else {}
             blind_grade = raw.get("structured_output")
