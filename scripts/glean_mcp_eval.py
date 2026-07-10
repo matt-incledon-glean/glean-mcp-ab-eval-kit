@@ -13,7 +13,9 @@ import datetime as dt
 import hashlib
 import json
 import os
+import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -33,6 +35,21 @@ USAGE_KEYS = (
 )
 
 DEFAULT_CONFIG = "eval.config.json"
+
+# CLI flags this kit depends on. `doctor` probes `claude --help` for these so
+# flag drift in a newer/older Claude Code is caught before a customer hits it.
+KIT_CLI_FLAGS = [
+    "--output-format",
+    "--model",
+    "--max-turns",
+    "--max-budget-usd",
+    "--permission-mode",
+    "--mcp-config",
+    "--strict-mcp-config",
+    "--allowedTools",
+    "--disallowedTools",
+    "--json-schema",
+]
 
 
 class EvalError(Exception):
@@ -231,12 +248,33 @@ def claude_mcp_list(root: Path) -> Dict[str, Any]:
     return {"available": True, "raw": res, "servers_hint": sorted(hints)}
 
 
+def claude_cli_check(root: Path) -> Dict[str, Any]:
+    if shutil.which("claude") is None:
+        return {"available": False, "version": None, "flags_supported": {}, "missing_flags": list(KIT_CLI_FLAGS)}
+    ver = run_subprocess(["claude", "--version"], cwd=root, timeout=30)
+    version_lines = ((ver.get("stdout") or "") + (ver.get("stderr") or "")).strip().splitlines()
+    help_res = run_subprocess(["claude", "--help"], cwd=root, timeout=30)
+    helptext = (help_res.get("stdout") or "") + "\n" + (help_res.get("stderr") or "")
+    flags = {f: (f in helptext) for f in KIT_CLI_FLAGS}
+    return {
+        "available": True,
+        "version": version_lines[0] if version_lines else "",
+        "flags_supported": flags,
+        "missing_flags": [f for f, ok in flags.items() if not ok],
+    }
+
+
 def server_present(server: str, inventory: Dict[str, Any], mcp_list: Dict[str, Any]) -> bool:
     s = normalize_server_name(server)
-    static = set(inventory.get("servers", []))
-    hinted = set(mcp_list.get("servers_hint", []))
+    if not s:
+        return False
+    if s in set(inventory.get("servers", [])) or s in set(mcp_list.get("servers_hint", [])):
+        return True
+    # Fallback: word-boundary match against the raw `claude mcp list` text so a
+    # short forbidden name (e.g. "teams", "zoom") cannot false-match an unrelated
+    # substring elsewhere in the output. Boundaries use the normalized charset.
     raw = json.dumps(mcp_list.get("raw") or {}).lower()
-    return s in static or s in hinted or bool(s and s in raw)
+    return re.search(r"(?<![a-z0-9_-])" + re.escape(s) + r"(?![a-z0-9_-])", raw) is not None
 
 
 def inventory_from_file(path: Path) -> Dict[str, Any]:
@@ -499,7 +537,12 @@ def run_claude_and_record(
     max_turns: Optional[int] = None,
     json_schema: Optional[Dict[str, Any]] = None,
     bare: bool = False,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
+    cmd = build_claude_command(root, cfg, acfg, prompt, model_key=model_key, max_turns=max_turns, json_schema=json_schema, bare=bare)
+    if dry_run:
+        print("DRY-RUN " + " ".join(shlex.quote(c) for c in cmd), flush=True)
+        return {"dry_run": True, "cmd": cmd, "success": None, "transcript": parse_transcript(None), "usage": {}, "total_tokens": 0}
     out_dir.mkdir(parents=True, exist_ok=True)
     write_text(out_dir / "prompt.txt", prompt)
     if shutil.which("claude") is None:
@@ -512,7 +555,6 @@ def run_claude_and_record(
         }
         write_json(out_dir / "run.json", result)
         return result
-    cmd = build_claude_command(root, cfg, acfg, prompt, model_key=model_key, max_turns=max_turns, json_schema=json_schema, bare=bare)
     started_at = now_iso()
     proc = run_subprocess(cmd, cwd=root, timeout=timeout)
     write_text(out_dir / "stdout.txt", proc.get("stdout") or "")
@@ -571,6 +613,7 @@ def command_preflight(args: argparse.Namespace) -> int:
             out / "live",
             timeout=int(cfg.get("preflight_timeout_seconds", 300)),
             max_turns=int(cfg.get("preflight_max_turns", 6)),
+            dry_run=args.dry_run,
         )
         observed = set((live_record.get("transcript") or {}).get("mcp_servers_used", {}).keys())
         required = set(normalize_server_name(x) for x in acfg.get("require_live_tool_servers", acfg.get("expected_mcp_servers", [])))
@@ -587,6 +630,9 @@ def command_preflight(args: argparse.Namespace) -> int:
         "live_record": live_record,
         "pass": overall_pass,
     }
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, "arm": args.arm, "static_pass": static.get("static_pass")}, indent=2))
+        return 0
     write_json(out / "preflight.json", record)
     latest = results_dir(config_path, cfg) / "_preflight" / args.arm / "latest.json"
     write_json(latest, record)
@@ -602,6 +648,19 @@ def command_preflight(args: argparse.Namespace) -> int:
 
 def safe_prompt_id(prompt_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", prompt_id).strip("_") or "prompt"
+
+
+def render_wrapper(wrapper: str, row: Dict[str, str]) -> str:
+    # Literal substitution, NOT str.format(): a golden prompt may legitimately
+    # contain { or } (JSON, code, table names), which would crash .format().
+    out = wrapper
+    for placeholder, value in (
+        ("{prompt}", row.get("Prompt", "")),
+        ("{id}", row.get("ID", "")),
+        ("{dept}", row.get("Dept", "")),
+    ):
+        out = out.replace(placeholder, value)
+    return out
 
 
 def command_run(args: argparse.Namespace) -> int:
@@ -622,7 +681,7 @@ def command_run(args: argparse.Namespace) -> int:
     failures = 0
     for i, row in enumerate(prompts, 1):
         pid = safe_prompt_id(row["ID"])
-        prompt_text = wrapper.format(prompt=row["Prompt"], id=row.get("ID", ""), dept=row.get("Dept", ""))
+        prompt_text = render_wrapper(wrapper, row)
         run_dir = out_root / pid
         metadata = {
             "id": row.get("ID"),
@@ -632,7 +691,8 @@ def command_run(args: argparse.Namespace) -> int:
             "participant_id": args.participant_id,
             "ordinal": i,
         }
-        write_json(run_dir / "metadata.json", metadata)
+        if not args.dry_run:
+            write_json(run_dir / "metadata.json", metadata)
         print(f"[{i}/{len(prompts)}] {args.arm} {pid}: running", flush=True)
         rec = run_claude_and_record(
             root,
@@ -641,7 +701,10 @@ def command_run(args: argparse.Namespace) -> int:
             prompt_text,
             run_dir,
             timeout=int(cfg.get("run_timeout_seconds", 1800)),
+            dry_run=args.dry_run,
         )
+        if args.dry_run:
+            continue
         if not rec.get("success"):
             failures += 1
         manifest["runs"].append({
@@ -659,6 +722,9 @@ def command_run(args: argparse.Namespace) -> int:
             f"retrieval={(rec.get('transcript') or {}).get('retrieval_attempted')}",
             flush=True,
         )
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, "arm": args.arm, "prompts": len(prompts)}, indent=2))
+        return 0
     manifest["completed_at"] = now_iso()
     manifest["failure_count"] = failures
     write_json(out_root / "arm_manifest.json", manifest)
@@ -773,31 +839,32 @@ def marginal_tokens(run: Dict[str, Any]) -> int:
     return int(u.get("input_tokens", 0)) + int(u.get("output_tokens", 0))
 
 
-def judge_prompt(meta: Dict[str, Any], run_a: Dict[str, Any], run_b: Dict[str, Any]) -> str:
-    return textwrap.dedent(f"""
-    You are an impartial evaluation judge for an A/B test comparing two assistant
-    configurations on enterprise knowledge tasks. You are NOT told which system
-    produced which answer; judge only on the merits.
-
-    Compare the two answers for one query. Judge quality first (completeness,
-    groundedness, usefulness). Prefer lower token usage only when quality is
-    materially similar. Do not reward a shorter answer if it is incomplete, vague,
-    or unsupported.
-
-    Query ID: {meta.get('id')}
-    Department: {meta.get('dept')}
-    Query: {meta.get('prompt')}
-
-    Answer A work tokens (input+output): {marginal_tokens(run_a)}
-    Answer A:
-    {run_a.get('_answer', '')}
-
-    Answer B work tokens (input+output): {marginal_tokens(run_b)}
-    Answer B:
-    {run_b.get('_answer', '')}
-
-    Return the required JSON object only, using "A", "B", or "tie" for the winner fields.
-    """).strip()
+def judge_prompt(meta: Dict[str, Any], run_a: Dict[str, Any], run_b: Dict[str, Any], hide_tokens: bool = False) -> str:
+    if hide_tokens:
+        # Pure-quality pass: token counts are withheld so they cannot anchor the
+        # quality scores (see docs/METHODOLOGY.md).
+        guidance = "Judge purely on quality: completeness, groundedness, and usefulness."
+        a_tok = b_tok = ""
+    else:
+        guidance = (
+            "Judge quality first (completeness, groundedness, usefulness). Prefer lower token "
+            "usage only when quality is materially similar. Do not reward a shorter answer if it "
+            "is incomplete, vague, or unsupported."
+        )
+        a_tok = f"Answer A work tokens (input+output): {marginal_tokens(run_a)}\n"
+        b_tok = f"Answer B work tokens (input+output): {marginal_tokens(run_b)}\n"
+    return (
+        "You are an impartial evaluation judge for an A/B test comparing two assistant "
+        "configurations on enterprise knowledge tasks. You are NOT told which system produced "
+        "which answer; judge only on the merits.\n\n"
+        f"{guidance}\n\n"
+        f"Query ID: {meta.get('id')}\n"
+        f"Department: {meta.get('dept')}\n"
+        f"Query: {meta.get('prompt')}\n\n"
+        f"{a_tok}Answer A:\n{run_a.get('_answer', '')}\n\n"
+        f"{b_tok}Answer B:\n{run_b.get('_answer', '')}\n\n"
+        'Return the required JSON object only, using "A", "B", or "tie" for the winner fields.'
+    )
 
 
 def command_grade(args: argparse.Namespace) -> int:
@@ -809,7 +876,13 @@ def command_grade(args: argparse.Namespace) -> int:
         print("No participant result directories found", file=sys.stderr)
         return 1
     failures = 0
-    judge_acfg = {"allowed_tools": []}
+    # Lock the judge down: no MCP servers (empty strict config) and no write/exec
+    # built-ins. It only needs to read the two answers and emit structured JSON.
+    judge_acfg = {
+        "allowed_tools": [],
+        "disallowed_tools": cfg.get("judge_disallowed_tools", ["Bash", "Write", "Edit", "NotebookEdit"]),
+        "mcp_config": cfg.get("judge_mcp_config", "config/mcp.none.json"),
+    }
     for pdir in participants:
         for pid, glean_dir, direct_dir in paired_prompt_dirs(pdir):
             grade_path = pdir / "grades" / pid / "grade.json"
@@ -823,7 +896,7 @@ def command_grade(args: argparse.Namespace) -> int:
             meta = glean_run.get("_metadata") or direct_run.get("_metadata") or {"id": pid}
             glean_is_a = blind_assignment(pdir.name, pid)
             run_a, run_b = (glean_run, direct_run) if glean_is_a else (direct_run, glean_run)
-            prompt = judge_prompt(meta, run_a, run_b)
+            prompt = judge_prompt(meta, run_a, run_b, hide_tokens=bool(cfg.get("judge_hide_tokens", False)))
             print(f"grading {pdir.name}/{pid} (glean shown as {'A' if glean_is_a else 'B'})", flush=True)
             rec = run_claude_and_record(
                 root,
@@ -960,6 +1033,27 @@ def mean(nums: Iterable[float]) -> float:
     return sum(vals) / len(vals) if vals else 0.0
 
 
+def bootstrap_savings_ci(pairs: List[Tuple[Any, Any]], n_boot: int = 2000, seed: int = 1234) -> Optional[Tuple[float, float]]:
+    # Bootstrap a 95% CI for the ratio-of-means savings %:
+    # (mean(direct) - mean(glean)) / mean(direct) * 100. Seeded for reproducibility.
+    usable = [(float(g), float(d)) for g, d in pairs if d not in ("", None) and float(d) != 0.0]
+    if len(usable) < 2:
+        return None
+    rnd = random.Random(seed)
+    k = len(usable)
+    ests = []
+    for _ in range(n_boot):
+        sample = [usable[rnd.randrange(k)] for _ in range(k)]
+        mg = sum(g for g, _ in sample) / k
+        md = sum(d for _, d in sample) / k
+        if md:
+            ests.append((md - mg) / md * 100.0)
+    if not ests:
+        return None
+    ests.sort()
+    return (round(ests[int(0.025 * (len(ests) - 1))], 1), round(ests[int(0.975 * (len(ests) - 1))], 1))
+
+
 def command_report(args: argparse.Namespace) -> int:
     config_path, cfg = load_config(args.config)
     res = results_dir(config_path, cfg)
@@ -1010,6 +1104,14 @@ def command_report(args: argparse.Namespace) -> int:
     list_cost_savings = pct_lower(dc_avg, gc_avg)
     latency_savings = pct_lower(d_lat_avg, g_lat_avg)
     invalid_count = len(rows) - len(valid)
+
+    def ci_str(ci: Optional[Tuple[float, float]]) -> str:
+        if ci:
+            return f" (95% CI {ci[0]:.1f} to {ci[1]:.1f}%, n={len(denom_rows)}, bootstrap)"
+        return f" (n={len(denom_rows)}; need ≥2 rows for a CI)"
+
+    reported_cost_ci = bootstrap_savings_ci([(r["glean_reported_cost_usd"], r["direct_reported_cost_usd"]) for r in denom_rows])
+    marginal_ci = bootstrap_savings_ci([(r["glean_marginal_tokens"], r["direct_marginal_tokens"]) for r in denom_rows])
     md = f"""# Aggregate summary
 
 Generated: {now_iso()}
@@ -1033,6 +1135,8 @@ Primary metric is the cost Claude Code reports per run. List-price-normalized co
 | Avg list-price-normalized cost / task | ${gc_avg:,.4f} | ${dc_avg:,.4f} | {list_cost_savings:.1f}% lower for Glean |
 
 > List-price-normalized cost is a rate-card comparison, not billed spend. Verify `pricing_per_million` against current model list prices; it can diverge sharply from reported cost when cache-creation tokens dominate.
+>
+> Reported-cost savings for Glean: **{reported_cost_savings:.1f}%**{ci_str(reported_cost_ci)}.
 
 ## Tokens
 
@@ -1045,6 +1149,8 @@ Marginal = per-prompt work (input + output). Fixed = per-session cache creation 
 | Avg total tokens / task | {gt_avg:,.0f} | {dt_avg:,.0f} | {total_token_savings:.1f}% lower for Glean |
 
 > Prefer marginal tokens + reported cost for headline claims. Raw totals are dominated by per-session cache creation and can mislead.
+>
+> Marginal-token savings for Glean: **{marginal_savings:.1f}%**{ci_str(marginal_ci)}.
 
 ## Latency
 
@@ -1085,6 +1191,8 @@ Detailed rows: [`aggregate_rows.csv`](aggregate_rows.csv)
         "avg_reported_cost_savings_pct": round(reported_cost_savings, 2),
         "avg_list_cost_savings_pct": round(list_cost_savings, 2),
         "avg_latency_savings_pct": round(latency_savings, 2),
+        "reported_cost_savings_ci_pct": reported_cost_ci,
+        "marginal_token_savings_ci_pct": marginal_ci,
     }, indent=2))
     return 0
 
@@ -1184,6 +1292,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "created_at": now_iso(),
         "root": str(root),
         "claude_on_path": shutil.which("claude"),
+        "claude_cli": claude_cli_check(root),
         "static_mcp_inventory": static_mcp_inventory(root),
         "claude_mcp_list": claude_mcp_list(root),
         "prompts_count": len(load_prompts(config_path, cfg)),
@@ -1209,12 +1318,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_config(sp)
     sp.add_argument("--arm", required=True, help="Arm name from config, e.g. glean or direct")
     sp.add_argument("--live", action="store_true", help="Run live Claude Code preflight probe")
+    sp.add_argument("--dry-run", action="store_true", help="Print the exact claude command without executing")
     sp.set_defaults(func=command_preflight)
 
     sp = sub.add_parser("run", help="Run all prompts for one participant/arm")
     add_config(sp)
     sp.add_argument("--arm", required=True, help="Arm name from config, e.g. glean or direct")
     sp.add_argument("--participant-id", required=True, help="Stable anonymous participant ID")
+    sp.add_argument("--dry-run", action="store_true", help="Print the exact claude commands without executing")
     sp.set_defaults(func=command_run)
 
     sp = sub.add_parser("grade", help="Judge paired Glean/direct answers")
