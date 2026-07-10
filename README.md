@@ -14,6 +14,50 @@ The kit is modeled after an enterprise crossover pilot pattern:
 
 > This repository does **not** ship customer-specific prompts or connector credentials. Customers provide their own MCP configs and golden prompt TSV.
 
+## How it works
+
+```mermaid
+flowchart TD
+    A["Download the kit<br/>(clone or unzip)"] --> B["Install & configure<br/>plugin / skill / CLI"]
+    B --> C["Copy per-arm MCP configs<br/>mcp/glean.mcp.json · mcp/direct.mcp.json"]
+    C --> D["Crossover schedule<br/>half glean-first, half direct-first"]
+
+    subgraph ArmA["Arm A · Glean MCP"]
+        direction TB
+        A1["Load only Glean<br/>--mcp-config --strict-mcp-config"] --> A2{{"Preflight gate<br/>expected present · forbidden absent<br/>model match · retrieval occurred"}}
+        A2 --> A3["Run each golden prompt<br/>fresh claude -p · read-only tools"]
+        A3 --> A4["Harvest JSONL transcript<br/>tokens · cost · latency · tool calls"]
+    end
+
+    subgraph ArmB["Arm B · vendor-direct MCP"]
+        direction TB
+        B1["Load only vendor MCP<br/>--mcp-config --strict-mcp-config"] --> B2{{"Preflight gate<br/>expected present · forbidden absent<br/>model match · retrieval occurred"}}
+        B2 --> B3["Run each golden prompt<br/>same set · same model · read-only"]
+        B3 --> B4["Harvest JSONL transcript<br/>tokens · cost · latency · tool calls"]
+    end
+
+    D --> A1
+    D --> B1
+    A4 --> J["Blind judge<br/>answers shown as A / B, de-blinded after"]
+    B4 --> J
+    J --> E["Efficiency<br/>tokens · cost · latency"]
+    J --> Q["Quality<br/>completeness · groundedness · winner"]
+    E --> R["Persist per-prompt rows<br/>results / participant / arm / prompt"]
+    Q --> R
+    R --> Z["Package eval_submission.zip<br/>(checksummed)"]
+    Z --> AGG["Admin aggregates<br/>import → grade → report"]
+    AGG --> DEL["Deliver readout<br/>aggregate_summary.md · CSV · bootstrap CIs"]
+
+    classDef gate stroke:#dc4c4c,stroke-width:2px,stroke-dasharray:5 4;
+    classDef armA stroke:#3559e6,stroke-width:2px;
+    classDef armB stroke:#b5791f,stroke-width:2px;
+    class A1,A3,A4 armA;
+    class B1,B3,B4 armB;
+    class A2,B2 gate;
+```
+
+A printable, standalone version of this diagram is at [`docs/glean_mcp_ab_eval_flow.html`](docs/glean_mcp_ab_eval_flow.html) — open it in a browser (light/dark aware).
+
 ## Repository layout
 
 ```text
@@ -34,6 +78,8 @@ docs/CONNECTOR_HEALTH_CHECKLIST.md
 docs/FIELD_RUNBOOK.md           Minimal field/customer runbook
 docs/READOUT_TEMPLATE.md        Stakeholder readout template
 docs/OPEN_SOURCE_NOTES.md       Sanitization checklist before publishing
+docs/glean_mcp_ab_eval_flow.html
+                              Standalone printable process-flow diagram
 ```
 
 ## Quick start
