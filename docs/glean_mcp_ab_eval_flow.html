@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Glean MCP A/B Eval Kit — Process Flow</title>
+<style>
+:root {
+  --artifact-background: #ffffff;
+  --artifact-background-light: #f1f3f6;
+  --artifact-background-mid: #e9ecf1;
+  --artifact-border-light: #e3e6ec;
+  --artifact-border-dark: #cdd2db;
+  --artifact-primary-brand: #3559e6;
+  --artifact-primary-highlight: #0d0f14;
+  --artifact-primary-hover: #2442b8;
+  --artifact-selected: #eaeefc;
+  --artifact-text-primary: #11141a;
+  --artifact-text-secondary: #5c6470;
+  --artifact-text-highlight: #e8eefc;
+  --artifact-positive-background: #e8f6ee;
+  --artifact-positive-text: #11141a;
+  --artifact-positive: #159a6a;
+  --artifact-negative: #dc4c4c;
+  --artifact-armA: #3559e6;
+  --artifact-armA-bg: #eaeefc;
+  --artifact-armB: #8a5a00;
+  --artifact-armB-bg: #fbf1de;
+}
+html[data-theme='dark'] {
+  --artifact-background: #0a0b0e;
+  --artifact-background-light: #121419;
+  --artifact-background-mid: #181b22;
+  --artifact-border-light: #23262e;
+  --artifact-border-dark: #343844;
+  --artifact-primary-brand: #6a92ff;
+  --artifact-primary-highlight: #f5f7fb;
+  --artifact-primary-hover: #88a8ff;
+  --artifact-selected: #1a2030;
+  --artifact-text-primary: #eef0f4;
+  --artifact-text-secondary: #9aa0ad;
+  --artifact-text-highlight: #14213d;
+  --artifact-positive-background: #0e2a1d;
+  --artifact-positive-text: #c8f5da;
+  --artifact-positive: #46d39a;
+  --artifact-negative: #ff6b6b;
+  --artifact-armA: #6a92ff;
+  --artifact-armA-bg: #16203a;
+  --artifact-armB: #d9a441;
+  --artifact-armB-bg: #2a2211;
+}
+* { box-sizing: border-box; }
+body {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-size: 16px; font-weight: 400; line-height: 1.6; letter-spacing: -0.005em;
+  background-color: var(--artifact-background); color: var(--artifact-text-primary);
+  margin: 0; padding: 48px 24px;
+}
+.shell { max-width: 1100px; margin: 0 auto; }
+.eyebrow {
+  font-family: "SF Mono", "IBM Plex Mono", "Cascadia Code", "Consolas", monospace;
+  font-size: 12px; font-weight: 500; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--artifact-text-secondary); margin: 0 0 10px;
+}
+h1 { font-size: clamp(2rem, 5vw, 3.2rem); font-weight: 300; line-height: 1.05; letter-spacing: -0.02em; margin: 0 0 12px; }
+.lede { color: var(--artifact-text-secondary); max-width: 720px; margin: 0 0 40px; font-size: 1.05rem; }
+
+/* High level ribbon */
+.ribbon { display: flex; align-items: stretch; gap: 0; flex-wrap: wrap; margin-bottom: 8px; }
+.ribbon-step {
+  flex: 1 1 200px; background: var(--artifact-background-light);
+  border: 1px solid var(--artifact-border-light); border-radius: 8px;
+  padding: 18px 20px; position: relative; min-width: 200px;
+}
+.ribbon-step .n {
+  font-family: "SF Mono", monospace; font-size: 11px; letter-spacing: 0.12em;
+  color: var(--artifact-primary-brand); text-transform: uppercase;
+}
+.ribbon-step h3 { font-size: 1.05rem; font-weight: 600; margin: 6px 0 4px; }
+.ribbon-step p { margin: 0; font-size: 0.85rem; color: var(--artifact-text-secondary); }
+.ribbon-arrow { align-self: center; color: var(--artifact-border-dark); font-size: 22px; padding: 0 6px; flex: 0 0 auto; }
+
+.section-tag {
+  font-family: "SF Mono", monospace; font-size: 12px; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--artifact-text-secondary);
+  margin: 56px 0 20px; padding-bottom: 10px; border-bottom: 1px solid var(--artifact-border-light);
+}
+
+/* Detailed vertical flow */
+.flow { display: flex; flex-direction: column; align-items: center; }
+.node {
+  width: 100%; max-width: 680px; background: var(--artifact-background); border: 1px solid var(--artifact-border-dark);
+  border-radius: 8px; padding: 16px 20px; text-align: center;
+}
+.node .k {
+  font-family: "SF Mono", monospace; font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--artifact-primary-brand); display: block; margin-bottom: 4px;
+}
+.node h4 { margin: 0 0 4px; font-size: 1.02rem; font-weight: 600; }
+.node p { margin: 0; font-size: 0.82rem; color: var(--artifact-text-secondary); }
+.node code { font-family: "SF Mono", monospace; font-size: 12px; background: var(--artifact-background-mid); padding: 1px 5px; border-radius: 4px; }
+.connector { width: 2px; height: 26px; background: var(--artifact-border-dark); }
+.connector.small { height: 16px; }
+
+/* Two-arm split */
+.split-note { font-family:"SF Mono",monospace; font-size:11px; letter-spacing:0.1em; text-transform:uppercase; color:var(--artifact-text-secondary); margin: 4px 0 2px; }
+.arms { display: flex; gap: 24px; width: 100%; max-width: 780px; justify-content: center; flex-wrap: wrap; }
+.arm { flex: 1 1 320px; min-width: 300px; border-radius: 10px; padding: 6px 6px 16px; }
+.arm.a { background: var(--artifact-armA-bg); border: 1px solid var(--artifact-armA); }
+.arm.b { background: var(--artifact-armB-bg); border: 1px solid var(--artifact-armB); }
+.arm-head { text-align: center; padding: 12px; }
+.arm-head .badge { font-family:"SF Mono",monospace; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; }
+.arm.a .badge { color: var(--artifact-armA); }
+.arm.b .badge { color: var(--artifact-armB); }
+.arm-head h4 { margin: 4px 0 2px; font-size: 1.05rem; }
+.arm-head p { margin: 0; font-size: 0.8rem; color: var(--artifact-text-secondary); }
+.arm-inner { display: flex; flex-direction: column; align-items: center; }
+.mini {
+  width: calc(100% - 20px); background: var(--artifact-background); border: 1px solid var(--artifact-border-light);
+  border-radius: 6px; padding: 11px 14px; text-align: center;
+}
+.mini .k { font-family:"SF Mono",monospace; font-size:10px; letter-spacing:0.08em; text-transform:uppercase; color: var(--artifact-text-secondary); display:block; margin-bottom:2px; }
+.mini h5 { margin: 0 0 2px; font-size: 0.92rem; font-weight: 600; }
+.mini p { margin: 0; font-size: 0.76rem; color: var(--artifact-text-secondary); }
+.mini.gate { border: 1px dashed var(--artifact-negative); }
+.mini.gate .k { color: var(--artifact-negative); }
+.mini-conn { width: 2px; height: 14px; }
+.arm.a .mini-conn { background: var(--artifact-armA); opacity:.5; }
+.arm.b .mini-conn { background: var(--artifact-armB); opacity:.5; }
+
+.merge-label { text-align:center; }
+
+/* judge dual metric */
+.dual { display: flex; gap: 16px; width: 100%; max-width: 680px; }
+.dual .node { flex: 1; }
+.node.eff { border-color: var(--artifact-primary-brand); }
+.node.qual { border-color: var(--artifact-positive); }
+.node.eff .k { color: var(--artifact-primary-brand); }
+.node.qual .k { color: var(--artifact-positive); }
+
+.node.wide { max-width: 680px; }
+.node.strong { background: var(--artifact-text-highlight); border-color: var(--artifact-primary-brand); }
+.node.results { border-style: dashed; }
+
+.legend { display:flex; gap:24px; flex-wrap:wrap; margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--artifact-border-light); font-size: 0.82rem; color: var(--artifact-text-secondary); }
+.legend span { display:inline-flex; align-items:center; gap:8px; }
+.sw { width: 14px; height: 14px; border-radius: 3px; display:inline-block; }
+.sw.a { background: var(--artifact-armA-bg); border:1px solid var(--artifact-armA); }
+.sw.b { background: var(--artifact-armB-bg); border:1px solid var(--artifact-armB); }
+.sw.gate { background: transparent; border:1px dashed var(--artifact-negative); }
+
+@media print {
+  body { margin:0; padding: 0.4in 0.5in; background:#fff; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+  .shell { max-width:100% !important; }
+  .node, .mini, .arm, .ribbon-step { break-inside: avoid; }
+  button, [role="button"] { display:none !important; }
+  * { animation:none !important; transition:none !important; }
+}
+</style>
+</head>
+<body>
+<div class="shell">
+  <p class="eyebrow">Glean MCP A/B Eval Kit · Process Flow</p>
+  <h1>How the evaluation runs, end to end</h1>
+  <p class="lede">A defensible A/B evaluation of Glean MCP vs. vendor-direct MCP connectors in Claude Code. Same model, same prompts, same machine — usage harvested from real transcripts, graded blind, and aggregated centrally.</p>
+
+  <!-- HIGH LEVEL RIBBON -->
+  <div class="ribbon">
+    <div class="ribbon-step">
+      <span class="n">Stage 1</span>
+      <h3>Download files</h3>
+      <p>Get the kit (repo clone or zip) onto the participant machine.</p>
+    </div>
+    <div class="ribbon-arrow">→</div>
+    <div class="ribbon-step">
+      <span class="n">Stage 2</span>
+      <h3>Install &amp; run</h3>
+      <p>Install plugin / add skill, configure, then run the CLI commands.</p>
+    </div>
+    <div class="ribbon-arrow">→</div>
+    <div class="ribbon-step">
+      <span class="n">Stage 3</span>
+      <h3>Share results</h3>
+      <p>Package and send the submission zip for central aggregation.</p>
+    </div>
+  </div>
+
+  <!-- DETAILED FLOW -->
+  <p class="section-tag">Interim steps in detail</p>
+  <div class="flow">
+
+    <div class="node">
+      <span class="k">Setup</span>
+      <h4>Download files</h4>
+      <p>Clone the repo or unzip the distributed kit on the participant machine.</p>
+    </div>
+    <div class="connector"></div>
+
+    <div class="node">
+      <span class="k">Install</span>
+      <h4>Install plugin · add skill · run CLI</h4>
+      <p><code>/plugin install .</code> &nbsp;or&nbsp; <code>/glean-mcp-eval</code> skill &nbsp;or&nbsp; <code>scripts/glean_mcp_eval.py</code></p>
+    </div>
+    <div class="connector"></div>
+
+    <div class="node">
+      <span class="k">Configure</span>
+      <h4>Copy &amp; customize config</h4>
+      <p>Set <code>eval.config.json</code>: held-constant model, golden prompt TSV, and per-arm expected + forbidden MCP servers.</p>
+    </div>
+    <div class="connector"></div>
+
+    <div class="split-note">Split into two arms — crossover schedule</div>
+    <div class="connector small"></div>
+
+    <!-- TWO ARMS -->
+    <div class="arms">
+      <!-- ARM A -->
+      <div class="arm a">
+        <div class="arm-head">
+          <span class="badge">Arm A · Glean</span>
+          <h4>Claude Code + Glean MCP</h4>
+          <p>Retrieval through the Glean MCP connector</p>
+        </div>
+        <div class="arm-inner">
+          <div class="mini"><span class="k">Load MCPs</span><h5>Enable Glean MCP</h5><p>Only the expected Glean server is wired in.</p></div>
+          <div class="mini-conn"></div>
+          <div class="mini gate"><span class="k">Runtime gate · preflight</span><h5>Validity check by arm</h5><p>Fail if expected server missing, a forbidden server is present, model mismatches, or no retrieval occurs.</p></div>
+          <div class="mini-conn"></div>
+          <div class="mini"><span class="k">Run prompts</span><h5>Fresh <code>claude -p</code> per prompt</h5><p>Each golden prompt runs in an isolated headless session.</p></div>
+          <div class="mini-conn"></div>
+          <div class="mini"><span class="k">Record</span><h5>Harvest JSONL transcript</h5><p>Tokens, cost, MCP tool calls, and final answer — measured, not estimated.</p></div>
+        </div>
+      </div>
+      <!-- ARM B -->
+      <div class="arm b">
+        <div class="arm-head">
+          <span class="badge">Arm B · Direct</span>
+          <h4>Claude Code + vendor MCPs</h4>
+          <p>Retrieval through equivalent vendor-direct connectors</p>
+        </div>
+        <div class="arm-inner">
+          <div class="mini"><span class="k">Load MCPs</span><h5>Enable vendor MCPs</h5><p>Only the expected direct servers are wired in.</p></div>
+          <div class="mini-conn"></div>
+          <div class="mini gate"><span class="k">Runtime gate · preflight</span><h5>Validity check by arm</h5><p>Fail if expected server missing, a forbidden server is present, model mismatches, or no retrieval occurs.</p></div>
+          <div class="mini-conn"></div>
+          <div class="mini"><span class="k">Run prompts</span><h5>Fresh <code>claude -p</code> per prompt</h5><p>Same prompt set, same model, isolated headless sessions.</p></div>
+          <div class="mini-conn"></div>
+          <div class="mini"><span class="k">Record</span><h5>Harvest JSONL transcript</h5><p>Tokens, cost, MCP tool calls, and final answer — measured, not estimated.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="connector"></div>
+    <div class="split-note">Both arms converge for grading</div>
+    <div class="connector small"></div>
+
+    <div class="node">
+      <span class="k">Grade</span>
+      <h4>Pass to blind judge</h4>
+      <p>Recorded answers are scored without revealing which arm produced them.</p>
+    </div>
+    <div class="connector"></div>
+
+    <!-- DUAL EVAL -->
+    <div class="dual">
+      <div class="node eff">
+        <span class="k">Evaluate · Efficiency</span>
+        <h4>Cost &amp; usage</h4>
+        <p>Input/output tokens, cache tokens, total tokens, list-price cost, tool-call counts.</p>
+      </div>
+      <div class="node qual">
+        <span class="k">Evaluate · Quality</span>
+        <h4>Answer quality</h4>
+        <p>Completeness, groundedness, usefulness, and per-pair winner.</p>
+      </div>
+    </div>
+    <div class="connector"></div>
+
+    <div class="node results">
+      <span class="k">Persist</span>
+      <h4>Write to results file</h4>
+      <p>Per-prompt rows stored under <code>results/&lt;participant&gt;/&lt;arm&gt;/&lt;prompt_id&gt;/</code>, then packaged with checksums into <code>eval_submission.zip</code>.</p>
+    </div>
+    <div class="connector"></div>
+
+    <div class="node strong">
+      <span class="k">Aggregate</span>
+      <h4>Pass to admin for aggregation</h4>
+      <p>Analysis owner imports each participant zip, then runs grade → report → package to produce <code>aggregate_summary.md</code>, <code>aggregate_rows.csv</code>, and the submission manifest.</p>
+    </div>
+    <div class="connector"></div>
+
+    <div class="node">
+      <span class="k">Deliver</span>
+      <h4>Share results</h4>
+      <p>Stakeholder readout of efficiency and quality findings across all participants and arms.</p>
+    </div>
+
+  </div>
+
+  <div class="legend">
+    <span><i class="sw a"></i> Arm A — Glean MCP</span>
+    <span><i class="sw b"></i> Arm B — vendor-direct MCPs</span>
+    <span><i class="sw gate"></i> Runtime validity gate (preflight)</span>
+  </div>
+</div>
+
+</body>
+</html>
