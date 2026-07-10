@@ -167,29 +167,31 @@ Set the prompt file:
 "prompts_file": "golden_prompts.tsv"
 ```
 
-Set the Glean arm:
+`config/eval.config.example.json` is the source of truth for arm structure — copy it and adapt. Each arm should set `mcp_config` (per-arm isolation, see section 9), the real server names, and **read-only** tool lists. The shipped example uses `glean_default` (Glean) vs `atlassian` (vendor-direct):
 
 ```json
 "glean": {
   "label": "Glean MCP",
-  "expected_mcp_servers": ["glean"],
-  "forbidden_mcp_servers": ["slack", "jira", "atlassian", "gdrive", "github"],
-  "allowed_tools": ["mcp__glean"]
+  "mcp_config": "mcp/glean.mcp.json",
+  "expected_mcp_servers": ["glean_default"],
+  "forbidden_mcp_servers": ["atlassian", "slack", "jira", "confluence", "github", "notion", "google_drive", "gmail", "outlook", "zoom"],
+  "allowed_tools": ["mcp__glean_default__search", "mcp__glean_default__read_document", "mcp__glean_default__chat"],
+  "disallowed_tools": ["mcp__glean_default__run_tool", "mcp__glean_default__find_skills", "mcp__glean_default__read_skill_files"]
 }
 ```
-
-Set the direct arm:
 
 ```json
 "direct": {
-  "label": "Direct vendor MCPs",
-  "expected_mcp_servers": ["slack", "jira", "gdrive", "github"],
-  "forbidden_mcp_servers": ["glean"],
-  "allowed_tools": ["mcp__slack", "mcp__jira", "mcp__gdrive", "mcp__github"]
+  "label": "Atlassian (direct)",
+  "mcp_config": "mcp/direct.mcp.json",
+  "expected_mcp_servers": ["atlassian"],
+  "forbidden_mcp_servers": ["glean_default", "glean"],
+  "allowed_tools": ["mcp__atlassian__search", "mcp__atlassian__getJiraIssue", "mcp__atlassian__getConfluencePage"],
+  "disallowed_tools": ["mcp__atlassian__addCommentToJiraIssue", "mcp__atlassian__editJiraIssue", "mcp__atlassian__createJiraIssue", "mcp__atlassian__transitionJiraIssue"]
 }
 ```
 
-Important: server names must match the customer’s Claude Code MCP names. Run this to check:
+Important: server and tool names must match the customer’s Claude Code MCP names. Run `claude mcp list` to confirm servers, and keep `allowed_tools` limited to read/search tools while `disallowed_tools` blocks every write and any arbitrary-dispatch tool (e.g. Glean's `run_tool`) — a read-only eval must never mutate live systems.
 
 ```bash
 claude mcp list
@@ -205,9 +207,14 @@ python3 scripts/glean_mcp_eval.py doctor --config eval.config.json
 
 Then reduce `golden_prompts.tsv` to one harmless prompt and test both arms.
 
+> **Arm isolation.** If each arm sets `mcp_config` (recommended), the kit passes
+> `--mcp-config <file> --strict-mcp-config` and each arm runs with only its own
+> servers automatically — you do **not** enable/disable MCPs by hand. The manual
+> enable/disable steps below are only a fallback when per-arm `mcp_config` is not used.
+
 ### Arm 1: Glean
 
-In Claude Code, enable only Glean MCP and disable direct vendor MCPs.
+Fallback only (no per-arm `mcp_config`): in Claude Code, enable only Glean MCP and disable direct vendor MCPs.
 
 Then run:
 
@@ -218,7 +225,7 @@ python3 scripts/glean_mcp_eval.py run --config eval.config.json --arm glean --pa
 
 ### Arm 2: Direct
 
-Switch Claude Code MCP setup: disable Glean MCP, enable direct vendor MCPs.
+Fallback only (no per-arm `mcp_config`): switch Claude Code MCP setup — disable Glean MCP, enable direct vendor MCPs.
 
 Then run:
 

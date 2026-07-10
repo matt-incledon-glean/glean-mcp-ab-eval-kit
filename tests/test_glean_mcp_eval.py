@@ -157,5 +157,45 @@ class BlindGradingTest(unittest.TestCase):
         self.assertEqual(g["groundedness_direct"], 5)
 
 
+class ServerPresentTest(unittest.TestCase):
+    def test_exact_match_from_inventory(self):
+        inv = {"servers": ["glean_default"]}
+        mcp_list = {"servers_hint": [], "raw": None}
+        self.assertTrue(gme.server_present("glean_default", inv, mcp_list))
+
+    def test_no_substring_false_positive(self):
+        # "teams" must NOT match "myteamspace-connector" (regression: raw substring).
+        inv = {"servers": ["glean_default"]}
+        mcp_list = {"servers_hint": [], "raw": {"stdout": "myteamspace-connector: connected"}}
+        self.assertFalse(gme.server_present("teams", inv, mcp_list))
+
+    def test_word_boundary_true_positive(self):
+        inv = {"servers": []}
+        mcp_list = {"servers_hint": [], "raw": {"stdout": "zoom: connected"}}
+        self.assertTrue(gme.server_present("zoom", inv, mcp_list))
+
+
+class WrapperTest(unittest.TestCase):
+    def test_literal_braces_do_not_crash(self):
+        wrapper = "Dept {dept} / {id}\n\nQ: {prompt}"
+        row = {"Prompt": 'SELECT * FROM {schema}.t WHERE j={"a":1}', "ID": "Q1", "Dept": "Eng"}
+        out = gme.render_wrapper(wrapper, row)
+        self.assertIn("{schema}", out)
+        self.assertIn('{"a":1}', out)
+        self.assertIn("Dept Eng / Q1", out)
+
+
+class BootstrapTest(unittest.TestCase):
+    def test_constant_savings_gives_tight_ci(self):
+        pairs = [(1.0, 2.0), (1.0, 2.0), (1.0, 2.0)]  # each 50% lower
+        ci = gme.bootstrap_savings_ci(pairs)
+        self.assertEqual(ci, (50.0, 50.0))
+
+    def test_needs_two_rows(self):
+        self.assertIsNone(gme.bootstrap_savings_ci([(1.0, 2.0)]))
+        # zero/blank direct values are filtered out, leaving too few rows
+        self.assertIsNone(gme.bootstrap_savings_ci([(1.0, 0.0), (1.0, "")]))
+
+
 if __name__ == "__main__":
     unittest.main()

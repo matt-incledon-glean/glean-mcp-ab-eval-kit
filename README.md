@@ -23,6 +23,9 @@ commands/                       Plugin slash-command prompts
 scripts/glean_mcp_eval.py       Dependency-free Python CLI
 bin/glean-mcp-eval              Shell wrapper for zip installs
 config/eval.config.example.json Example customer config
+config/mcp.glean.example.json   Per-arm MCP config template (Glean arm)
+config/mcp.direct.example.json  Per-arm MCP config template (vendor-direct arm)
+config/mcp.none.json            Empty MCP config used to isolate the judge
 prompts/golden_prompts.example.tsv
                               Prompt TSV schema + safe sample prompts
 docs/METHODOLOGY.md             Evaluation design and caveats
@@ -51,17 +54,50 @@ If distributing as a zip, unzip it and install from that local path.
 ```bash
 cp config/eval.config.example.json eval.config.json
 cp prompts/golden_prompts.example.tsv golden_prompts.tsv
+mkdir -p mcp
+cp config/mcp.glean.example.json  mcp/glean.mcp.json
+cp config/mcp.direct.example.json mcp/direct.mcp.json
 ```
 
 Edit `eval.config.json`:
 
-- Set `prompts_file`.
-- Set the model name you want held constant.
-- Define `arms.glean.expected_mcp_servers` and `arms.direct.expected_mcp_servers`.
-- Define `forbidden_mcp_servers` for each arm.
-- Optionally set `allowed_tools`, `preflight_prompt`, and pricing.
+- Set `prompts_file` and the `model` to hold constant.
+- For each arm set `expected_mcp_servers`, `forbidden_mcp_servers`, and read-only
+  `allowed_tools` / `disallowed_tools`.
+- Optionally set `preflight_prompt`, `pricing_per_million`, `judge_hide_tokens`.
 
-### 3. Run preflight for the current arm
+Fill in `mcp/glean.mcp.json` (your Glean MCP URL + token) and `mcp/direct.mcp.json`
+(your vendor MCP). These live under `mcp/`, which is gitignored — they never ship.
+
+#### Arm isolation (preferred)
+
+Each arm sets `mcp_config` pointing to a JSON file that lists **only that arm's**
+MCP servers. Runs then pass `--mcp-config <file> --strict-mcp-config`, so each arm
+executes with exactly its own servers regardless of what is installed globally — **no
+manual enabling/disabling between arms.** This is the recommended, defensible path and
+removes the biggest source of human error.
+
+Manual toggling (disable Glean, enable the vendor MCPs between arms) is only a
+**fallback** for a Claude Code build without `--mcp-config`/`--strict-mcp-config`
+(check with `doctor`).
+
+Keep `allowed_tools`/`disallowed_tools` read-only: allow only `search`/`read`/`get*`
+tools and deny writes and any arbitrary-dispatch tool (e.g. Glean's `run_tool`), so a
+read-only eval can never mutate live systems.
+
+### 3. Sanity check, then run preflight
+
+First confirm the environment without spending tokens:
+
+```bash
+python3 scripts/glean_mcp_eval.py doctor --config eval.config.json
+```
+
+`doctor` reports whether `claude` is on PATH, **which CLI flags your Claude Code
+version supports** (catches drift), the MCP servers it can see, and the prompt count.
+
+Then validate each arm (add `--dry-run` to any command to print the exact `claude`
+invocation without executing — useful for a customer security review):
 
 ```bash
 python3 scripts/glean_mcp_eval.py preflight --config eval.config.json --arm glean --live
@@ -153,8 +189,9 @@ Per prompt / arm:
 - output tokens
 - cache creation/write tokens
 - cache read tokens
-- total tokens
-- configured list-price equivalent cost
+- total tokens (plus a marginal input+output vs fixed cache-creation split)
+- cost reported by Claude Code, and a configured list-price-equivalent cost
+- wall-clock latency
 - model(s) observed in transcript
 - MCP tool calls by server
 - retrieval-attempted flag
@@ -178,4 +215,4 @@ This kit records final answers and local transcript-derived metadata. Do not pub
 
 ## License
 
-Suggested: Apache-2.0. Add `LICENSE` before public release.
+See [`LICENSE`](LICENSE).
