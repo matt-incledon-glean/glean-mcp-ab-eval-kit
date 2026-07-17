@@ -27,6 +27,9 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from hosts.base import HostAdapter, get_adapter, register
+from hosts import cursor as _cursor  # noqa: F401  importing registers the "cursor" adapter
+
 USAGE_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -525,6 +528,57 @@ def cost_for_usage(cfg: Dict[str, Any], usage: Dict[str, int]) -> float:
     return sum((float(rates.get(k, 0.0)) * int(usage.get(k, 0)) / 1_000_000.0) for k in USAGE_KEYS)
 
 
+class ClaudeCodeAdapter(HostAdapter):
+    """Claude Code host: `claude -p`, harvest usage from the local JSONL transcript."""
+
+    name = "claude-code"
+    caps = {
+        "per_arm_isolation": True,      # --mcp-config <file> --strict-mcp-config
+        "readonly_gating": True,        # --allowedTools / --disallowedTools
+        "per_run_token_usage": True,    # harvested from ~/.claude/projects/**.jsonl
+        "reported_cost": True,          # total_cost_usd in the -p JSON result
+        "structured_output": True,      # --json-schema
+    }
+
+    def executable_present(self) -> bool:
+        return shutil.which("claude") is not None
+
+    def build_command(self, root, cfg, arm_cfg, prompt, out_dir, *, model_key="model", max_turns=None, json_schema=None):
+        cmd = build_claude_command(root, cfg, arm_cfg, prompt, model_key=model_key, max_turns=max_turns, json_schema=json_schema)
+        return cmd, {}
+
+    def harvest(self, proc, root, out_dir, cfg, ctx):
+        parsed = parse_claude_output(proc.get("stdout") or "")
+        write_json(out_dir / "claude_output.json", parsed)
+        answer = parsed.get("result") or parsed.get("structured_output") or ""
+        answer_text = json.dumps(answer, indent=2, sort_keys=True) if isinstance(answer, (dict, list)) else str(answer)
+        session_id = parsed.get("session_id") or parsed.get("sessionId")
+        transcript = parse_transcript(find_transcript(session_id, root))
+        return {
+            "ok": proc.get("returncode") == 0 and not parsed.get("is_error", False),
+            "session_id": session_id,
+            "transcript": transcript,
+            "usage": transcript.get("usage", {}),
+            "reported_cost_usd": parsed.get("total_cost_usd") or parsed.get("cost_usd"),
+            "duration_ms": parsed.get("duration_ms"),
+            "num_turns": parsed.get("num_turns"),
+            "answer_text": answer_text,
+            "raw_output_path": str(out_dir / "claude_output.json"),
+            "output_type": parsed.get("type"),
+            "output_subtype": parsed.get("subtype"),
+        }
+
+    def doctor(self, root):
+        return {
+            "claude_cli": claude_cli_check(root),
+            "static_mcp_inventory": static_mcp_inventory(root),
+            "claude_mcp_list": claude_mcp_list(root),
+        }
+
+
+register(ClaudeCodeAdapter())
+
+
 def run_claude_and_record(
     root: Path,
     cfg: Dict[str, Any],
@@ -536,59 +590,69 @@ def run_claude_and_record(
     model_key: str = "model",
     max_turns: Optional[int] = None,
     json_schema: Optional[Dict[str, Any]] = None,
-    bare: bool = False,
     dry_run: bool = False,
+    host: Optional[str] = None,
 ) -> Dict[str, Any]:
-    cmd = build_claude_command(root, cfg, acfg, prompt, model_key=model_key, max_turns=max_turns, json_schema=json_schema, bare=bare)
+    """Run one prompt via the selected host adapter and write a normalized run.json.
+
+    Host-specific work (build command, harvest usage) is delegated to the adapter;
+    everything else here — file layout, computed cost, run.json shape — is shared,
+    so `report`/`grade`/`package` are identical across hosts.
+    """
+    adapter = get_adapter(host or cfg.get("host"))
+    cmd, ctx = adapter.build_command(
+        root, cfg, acfg, prompt, out_dir,
+        model_key=model_key, max_turns=max_turns, json_schema=json_schema,
+    )
     if dry_run:
         print("DRY-RUN " + " ".join(shlex.quote(c) for c in cmd), flush=True)
         return {"dry_run": True, "cmd": cmd, "success": None, "transcript": parse_transcript(None), "usage": {}, "total_tokens": 0}
     out_dir.mkdir(parents=True, exist_ok=True)
     write_text(out_dir / "prompt.txt", prompt)
-    if shutil.which("claude") is None:
+    if not adapter.executable_present():
         result = {
             "started_at": now_iso(),
+            "host": adapter.name,
             "returncode": 127,
-            "error": "claude CLI not found on PATH",
-            "claude_output": None,
+            "success": False,
+            "error": f"{adapter.name} executable not found on PATH",
             "transcript": parse_transcript(None),
+            "usage": {},
+            "total_tokens": 0,
         }
         write_json(out_dir / "run.json", result)
         return result
+    adapter.prepare(ctx)
     started_at = now_iso()
-    proc = run_subprocess(cmd, cwd=root, timeout=timeout)
+    cwd = Path(ctx["cwd"]) if ctx.get("cwd") else root
+    proc = run_subprocess(cmd, cwd=cwd, timeout=timeout)
     write_text(out_dir / "stdout.txt", proc.get("stdout") or "")
     write_text(out_dir / "stderr.txt", proc.get("stderr") or "")
-    write_json(out_dir / "command.json", {"cmd": cmd, "cwd": str(root), "started_at": started_at, "subprocess": proc})
-    parsed = parse_claude_output(proc.get("stdout") or "")
-    write_json(out_dir / "claude_output.json", parsed)
-    answer = parsed.get("result") or parsed.get("structured_output") or ""
-    if isinstance(answer, (dict, list)):
-        answer_text = json.dumps(answer, indent=2, sort_keys=True)
-    else:
-        answer_text = str(answer)
-    write_text(out_dir / "answer.md", answer_text)
-    session_id = parsed.get("session_id") or parsed.get("sessionId")
-    transcript_path = find_transcript(session_id, root)
-    transcript = parse_transcript(transcript_path)
-    usage = transcript.get("usage", {})
+    write_json(out_dir / "command.json", {"cmd": cmd, "cwd": str(cwd), "started_at": started_at, "subprocess": proc})
+    h = adapter.harvest(proc, root, out_dir, cfg, ctx)
+    transcript = h.get("transcript") or parse_transcript(None)
+    usage = h.get("usage") or transcript.get("usage", {}) or {}
+    write_text(out_dir / "answer.md", h.get("answer_text", ""))
     record = {
         "started_at": started_at,
         "completed_at": now_iso(),
+        "host": adapter.name,
         "returncode": proc.get("returncode"),
-        "success": proc.get("returncode") == 0 and not parsed.get("is_error", False),
-        "session_id": session_id,
-        "claude_output_type": parsed.get("type"),
-        "claude_output_subtype": parsed.get("subtype"),
-        "total_cost_usd_reported_by_claude": parsed.get("total_cost_usd") or parsed.get("cost_usd"),
-        "duration_ms_reported_by_claude": parsed.get("duration_ms"),
-        "num_turns_reported_by_claude": parsed.get("num_turns"),
+        "success": bool(h.get("ok")),
+        "session_id": h.get("session_id"),
+        "claude_output_type": h.get("output_type"),
+        "claude_output_subtype": h.get("output_subtype"),
+        # "reported_by_claude" keys are kept for stable downstream columns; they hold
+        # the host-reported figures (None for hosts that do not expose them, e.g. Cursor cost).
+        "total_cost_usd_reported_by_claude": h.get("reported_cost_usd"),
+        "duration_ms_reported_by_claude": h.get("duration_ms"),
+        "num_turns_reported_by_claude": h.get("num_turns"),
         "transcript": transcript,
         "usage": usage,
         "total_tokens": usage_total_tokens(usage),
         "computed_cost_usd": round(cost_for_usage(cfg, usage), 6),
         "answer_path": str(out_dir / "answer.md"),
-        "raw_output_path": str(out_dir / "claude_output.json"),
+        "raw_output_path": h.get("raw_output_path"),
         "stderr_path": str(out_dir / "stderr.txt"),
     }
     write_json(out_dir / "run.json", record)
@@ -599,6 +663,7 @@ def command_preflight(args: argparse.Namespace) -> int:
     config_path, cfg = load_config(args.config)
     root = repo_root_for_config(config_path)
     acfg = arm_config(cfg, args.arm)
+    host = getattr(args, "host", None) or cfg.get("host") or "claude-code"
     out = results_dir(config_path, cfg) / "_preflight" / args.arm / slug_ts()
     static = validate_static_setup(root, cfg, args.arm)
     live_record = None
@@ -614,6 +679,7 @@ def command_preflight(args: argparse.Namespace) -> int:
             timeout=int(cfg.get("preflight_timeout_seconds", 300)),
             max_turns=int(cfg.get("preflight_max_turns", 6)),
             dry_run=args.dry_run,
+            host=host,
         )
         observed = set((live_record.get("transcript") or {}).get("mcp_servers_used", {}).keys())
         required = set(normalize_server_name(x) for x in acfg.get("require_live_tool_servers", acfg.get("expected_mcp_servers", [])))
@@ -623,6 +689,7 @@ def command_preflight(args: argparse.Namespace) -> int:
     record = {
         "created_at": now_iso(),
         "eval_name": cfg.get("eval_name"),
+        "host": host,
         "arm": args.arm,
         "static": static,
         "live_enabled": bool(args.live),
@@ -667,6 +734,7 @@ def command_run(args: argparse.Namespace) -> int:
     config_path, cfg = load_config(args.config)
     root = repo_root_for_config(config_path)
     acfg = arm_config(cfg, args.arm)
+    host = getattr(args, "host", None) or cfg.get("host") or "claude-code"
     prompts = load_prompts(config_path, cfg)
     out_root = results_dir(config_path, cfg) / args.participant_id / args.arm
     wrapper = cfg.get("prompt_wrapper") or "{prompt}"
@@ -702,6 +770,7 @@ def command_run(args: argparse.Namespace) -> int:
             run_dir,
             timeout=int(cfg.get("run_timeout_seconds", 1800)),
             dry_run=args.dry_run,
+            host=host,
         )
         if args.dry_run:
             continue
@@ -908,9 +977,10 @@ def command_grade(args: argparse.Namespace) -> int:
                 model_key="judge_model",
                 max_turns=int(cfg.get("judge_max_turns", 3)),
                 json_schema=grade_schema(),
-                # Do NOT pass bare=True: --bare skips the plugin/settings that
-                # inject Glean LLM Gateway auth, so the judge fails with
-                # "Not logged in". The judge only needs to emit structured JSON.
+                # Judge runs on a structured-output-capable host (default claude-code),
+                # regardless of which host the arms ran on — keeps quality scores
+                # comparable across hosts and enforces the JSON-schema grade.
+                host=cfg.get("judge_host") or "claude-code",
             )
             raw = read_json(Path(rec["raw_output_path"])) if rec.get("raw_output_path") and Path(rec["raw_output_path"]).exists() else {}
             blind_grade = raw.get("structured_output")
@@ -1288,16 +1358,18 @@ def command_import(args: argparse.Namespace) -> int:
 def command_doctor(args: argparse.Namespace) -> int:
     config_path, cfg = load_config(args.config)
     root = repo_root_for_config(config_path)
+    host = getattr(args, "host", None) or cfg.get("host") or "claude-code"
+    adapter = get_adapter(host)
     data = {
         "created_at": now_iso(),
         "root": str(root),
-        "claude_on_path": shutil.which("claude"),
-        "claude_cli": claude_cli_check(root),
-        "static_mcp_inventory": static_mcp_inventory(root),
-        "claude_mcp_list": claude_mcp_list(root),
+        "host": host,
+        "host_executable_present": adapter.executable_present(),
+        "caps": adapter.caps,
         "prompts_count": len(load_prompts(config_path, cfg)),
         "results_dir": str(results_dir(config_path, cfg)),
     }
+    data.update(adapter.doctor(root))
     print(json.dumps(data, indent=2))
     return 0
 
@@ -1310,22 +1382,28 @@ def build_parser() -> argparse.ArgumentParser:
     def add_config(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("--config", default=DEFAULT_CONFIG, help="Path to eval config JSON")
 
-    sp = sub.add_parser("doctor", help="Inspect local config and Claude/MCP availability")
+    def add_host(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--host", help="Host adapter: 'claude-code' (default) or 'cursor'; overrides config 'host'")
+
+    sp = sub.add_parser("doctor", help="Inspect local config and host/MCP availability")
     add_config(sp)
+    add_host(sp)
     sp.set_defaults(func=command_doctor)
 
     sp = sub.add_parser("preflight", help="Validate setup for one arm")
     add_config(sp)
+    add_host(sp)
     sp.add_argument("--arm", required=True, help="Arm name from config, e.g. glean or direct")
-    sp.add_argument("--live", action="store_true", help="Run live Claude Code preflight probe")
-    sp.add_argument("--dry-run", action="store_true", help="Print the exact claude command without executing")
+    sp.add_argument("--live", action="store_true", help="Run a live headless preflight probe")
+    sp.add_argument("--dry-run", action="store_true", help="Print the exact command without executing")
     sp.set_defaults(func=command_preflight)
 
     sp = sub.add_parser("run", help="Run all prompts for one participant/arm")
     add_config(sp)
+    add_host(sp)
     sp.add_argument("--arm", required=True, help="Arm name from config, e.g. glean or direct")
     sp.add_argument("--participant-id", required=True, help="Stable anonymous participant ID")
-    sp.add_argument("--dry-run", action="store_true", help="Print the exact claude commands without executing")
+    sp.add_argument("--dry-run", action="store_true", help="Print the exact commands without executing")
     sp.set_defaults(func=command_run)
 
     sp = sub.add_parser("grade", help="Judge paired Glean/direct answers")

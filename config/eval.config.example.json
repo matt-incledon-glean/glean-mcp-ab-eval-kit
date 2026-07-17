@@ -1,9 +1,11 @@
 {
   "eval_name": "customer-glean-mcp-ab-eval",
+  "host": "claude-code",
   "prompts_file": "golden_prompts.tsv",
   "results_dir": "results",
   "model": "opus",
   "judge_model": "opus",
+  "judge_host": "claude-code",
   "judge_mcp_config": "config/mcp.none.json",
   "judge_hide_tokens": false,
   "max_turns": 12,

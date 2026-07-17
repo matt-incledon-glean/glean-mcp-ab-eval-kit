@@ -1,6 +1,6 @@
 # Glean MCP A/B Eval Kit
 
-Open-sourceable kit for running a defensible A/B evaluation of **Glean MCP** vs **vendor-direct MCP connectors** in Claude Code.
+Open-sourceable kit for running a defensible A/B evaluation of **Glean MCP** vs **vendor-direct MCP connectors** in agent hosts like **Claude Code** and **Cursor**.
 
 The kit is modeled after an enterprise crossover pilot pattern:
 
@@ -58,21 +58,42 @@ flowchart TD
 
 A printable, standalone version of this diagram is at [`docs/glean_mcp_ab_eval_flow.html`](docs/glean_mcp_ab_eval_flow.html) — open it in a browser (light/dark aware).
 
+## Hosts
+
+The eval runs on multiple agent hosts behind one host-agnostic core — same prompts, blind judge, metrics, and aggregation, so results are comparable across hosts. Set `"host"` in `eval.config.json` (or pass `--host`), then follow that host's guide.
+
+| Capability | Claude Code | Cursor |
+|---|---|---|
+| Headless per-prompt run | ✅ `claude -p` | ✅ `cursor-agent -p` |
+| Per-arm MCP isolation | ✅ `--strict-mcp-config` | ✅ per-arm `--workspace` |
+| Read-only tool gating | ✅ allow/deny flags | ✅ `.cursor/cli.json` |
+| Per-run token usage | ✅ from transcript | ⚠️ verify on CLI version |
+| Per-run $ cost | ✅ reported | ❌ list-price-normalized only |
+| Structured judge output | ✅ `--json-schema` | ❌ → judge runs on `judge_host` |
+
+- **Claude Code** (default, reference host) — [docs/hosts/claude-code.md](docs/hosts/claude-code.md)
+- **Cursor** (skeleton — see the guide for open `TODO(verify)` items) — [docs/hosts/cursor.md](docs/hosts/cursor.md)
+
+Adapters live in `scripts/hosts/` behind the `HostAdapter` contract in `scripts/hosts/base.py`; adding a host means adding one module there. The quick start below uses Claude Code.
+
 ## Repository layout
 
 ```text
 .claude-plugin/plugin.json       Claude Code plugin manifest
 commands/                       Plugin slash-command prompts
 .claude/skills/glean-mcp-eval/  Project skill alternative to plugin commands
-scripts/glean_mcp_eval.py       Dependency-free Python CLI
+scripts/glean_mcp_eval.py       Host-agnostic CLI, orchestration, Claude Code adapter
+scripts/hosts/                  Host adapter contract (base.py) + Cursor adapter (cursor.py)
 bin/glean-mcp-eval              Shell wrapper for zip installs
 config/eval.config.example.json Example customer config
 config/mcp.glean.example.json   Per-arm MCP config template (Glean arm)
 config/mcp.direct.example.json  Per-arm MCP config template (vendor-direct arm)
 config/mcp.none.json            Empty MCP config used to isolate the judge
+config/mcp.cursor.example.json  Per-arm MCP config template (Cursor server shape)
 prompts/golden_prompts.example.tsv
                               Prompt TSV schema + safe sample prompts
 docs/METHODOLOGY.md             Evaluation design and caveats
+docs/hosts/                     Per-host setup guides (claude-code.md, cursor.md)
 docs/CONNECTOR_HEALTH_CHECKLIST.md
                               Daily connector health process
 docs/FIELD_RUNBOOK.md           Minimal field/customer runbook

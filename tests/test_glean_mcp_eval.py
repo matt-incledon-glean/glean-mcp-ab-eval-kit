@@ -197,5 +197,38 @@ class BootstrapTest(unittest.TestCase):
         self.assertIsNone(gme.bootstrap_savings_ci([(1.0, 0.0), (1.0, "")]))
 
 
+class HostAdapterTest(unittest.TestCase):
+    def test_registry_has_both_hosts(self):
+        self.assertEqual(gme.get_adapter("claude-code").name, "claude-code")
+        self.assertEqual(gme.get_adapter("cursor").name, "cursor")
+        self.assertEqual(gme.get_adapter(None).name, "claude-code")  # default
+
+    def test_claude_command_shape(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = {"model": "opus"}
+            arm = {"allowed_tools": ["mcp__glean_default__search"], "disallowed_tools": ["mcp__glean_default__run_tool"]}
+            cmd, _ctx = gme.get_adapter("claude-code").build_command(root, cfg, arm, "hi", root / "out")
+            self.assertEqual(cmd[0], "claude")
+            self.assertIn("--allowedTools", cmd)
+            self.assertIn("--disallowedTools", cmd)
+
+    def test_cursor_command_and_readonly_isolation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = {"model": "sonnet-4"}
+            arm = {"allowed_tools": ["mcp__atlassian__search"], "disallowed_tools": ["mcp__atlassian__editJiraIssue"]}
+            cmd, ctx = gme.get_adapter("cursor").build_command(root, cfg, arm, "hi", root / "out")
+            self.assertEqual(cmd[0], "cursor-agent")
+            self.assertIn("--workspace", cmd)
+            self.assertIn("stream-json", cmd)
+            # allow-list translated to Cursor rule grammar
+            self.assertIn("Mcp(atlassian:search)", ctx["permissions"]["allow"])
+            self.assertIn("Mcp(atlassian:editJiraIssue)", ctx["permissions"]["deny"])
+            # read-only floor: writes/shell are always denied for an eval run
+            self.assertIn("Write(**)", ctx["permissions"]["deny"])
+            self.assertIn("Shell(**)", ctx["permissions"]["deny"])
+
+
 if __name__ == "__main__":
     unittest.main()
