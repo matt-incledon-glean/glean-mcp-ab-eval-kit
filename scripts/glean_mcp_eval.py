@@ -862,7 +862,6 @@ def blind_assignment(participant_id: str, prompt_id: str) -> bool:
     h = hashlib.sha256(f"{participant_id}/{prompt_id}".encode("utf-8")).hexdigest()
     return int(h[:8], 16) % 2 == 0
 
-
 def _pick_alias(bg: Dict[str, Any], *keys: str) -> Any:
     """Return the first present, non-empty value among keys.
 
@@ -898,6 +897,59 @@ def _normalize_judge_aliases(bg: Dict[str, Any]) -> None:
     conf = bg.get("confidence")
     if not isinstance(conf, bool) and isinstance(conf, (int, float)):
         bg["confidence"] = "high" if float(conf) >= 0.8 else "medium" if float(conf) >= 0.5 else "low"
+
+
+def _coerce_score(value: Any) -> Optional[int]:
+    """Coerce a judge score to an int in [1, 5], or None if it isn't usable."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        n = int(round(value))
+    elif isinstance(value, str):
+        m = re.search(r"-?\d+(?:\.\d+)?", value)
+        if not m:
+            return None
+        n = int(round(float(m.group())))
+    else:
+        return None
+    return max(1, min(5, n))
+
+
+def _normalize_numeric_scores(bg: Dict[str, Any]) -> None:
+    """In-place: populate blind completeness_{a,b}/groundedness_{a,b} integers.
+
+    Claude Code fills these from the enforced JSON schema. Schema-free hosts such
+    as Cursor emit only what the prose asked for and may nest the scores (e.g.
+    {"scores": {"completeness": {"a": 4, "b": 5}}}) or vary casing. Map those
+    shapes to the kit's flat keys and clamp to integers in [1, 5]; leave the
+    field absent when no usable value is found so it renders as blank, not 0.
+    """
+    if not isinstance(bg, dict):
+        return
+    nested: Dict[str, Any] = {}
+    for container_key in ("scores", "quality_scores", "ratings"):
+        val = bg.get(container_key)
+        if isinstance(val, dict):
+            nested = val
+            break
+    for dim in ("completeness", "groundedness"):
+        dim_obj = nested.get(dim) if isinstance(nested.get(dim), dict) else {}
+        for side in ("a", "b"):
+            target = f"{dim}_{side}"
+            existing = _coerce_score(bg.get(target))
+            if existing is not None:
+                bg[target] = existing
+                continue
+            candidate = (
+                bg.get(f"{dim}_{side.upper()}")
+                or bg.get(f"{dim}_answer_{side}")
+                or dim_obj.get(side)
+                or dim_obj.get(side.upper())
+                or dim_obj.get(f"answer_{side}")
+            )
+            coerced = _coerce_score(candidate)
+            if coerced is not None:
+                bg[target] = coerced
 
 
 def deblind_grade(bg: Dict[str, Any], glean_is_a: bool) -> Dict[str, Any]:
@@ -987,6 +1039,17 @@ def judge_prompt(meta: Dict[str, Any], run_a: Dict[str, Any], run_b: Dict[str, A
         f"Query: {meta.get('prompt')}\n\n"
         f"{a_tok}Answer A:\n{run_a.get('_answer', '')}\n\n"
         f"{b_tok}Answer B:\n{run_b.get('_answer', '')}\n\n"
+        # Hosts with JSON-schema enforcement (e.g. Claude Code) fill the numeric
+        # score fields from the schema, but schema-free hosts (e.g. Cursor) only
+        # emit what the prose asks for. Spell the integer scores out explicitly so
+        # completeness/groundedness are populated regardless of host.
+        "Also rate each answer on two dimensions using an integer from 1 (worst) "
+        "to 5 (best):\n"
+        "- completeness: how fully the answer addresses the query.\n"
+        "- groundedness: how well claims are supported by cited/verifiable sources.\n"
+        "Report them as the JSON fields completeness_a, completeness_b, "
+        "groundedness_a, and groundedness_b (integers 1-5), where _a is Answer A "
+        "and _b is Answer B.\n\n"
         'Return the required JSON object only, using "A", "B", or "tie" for the winner fields.'
     )
 
@@ -1063,6 +1126,11 @@ def command_grade(args: argparse.Namespace) -> int:
                         continue
             if isinstance(blind_grade, dict):
                 _normalize_judge_aliases(blind_grade)
+                # Numeric quality scores. Schema-free hosts (Cursor) may nest the
+                # scores or vary the key casing; normalize to the kit's flat
+                # completeness_{a,b}/groundedness_{a,b} integers so the aggregate
+                # quality table is populated instead of showing 0.00.
+                _normalize_numeric_scores(blind_grade)
             if not isinstance(blind_grade, dict):
                 failures += 1
                 blind_grade = None

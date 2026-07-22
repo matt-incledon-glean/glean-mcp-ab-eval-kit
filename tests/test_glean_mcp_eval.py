@@ -265,6 +265,48 @@ class ServerIsolationValidityTest(unittest.TestCase):
         self.assertNotIn("glean_unexpected_server", flags)
 
 
+class NumericScoreNormalizationTest(unittest.TestCase):
+    def test_coerce_score_clamps_and_parses(self):
+        self.assertEqual(gme._coerce_score(4), 4)
+        self.assertEqual(gme._coerce_score(4.6), 5)
+        self.assertEqual(gme._coerce_score(9), 5)      # clamp high
+        self.assertEqual(gme._coerce_score(0), 1)      # clamp low
+        self.assertEqual(gme._coerce_score("4/5"), 4)  # parse from string
+        self.assertIsNone(gme._coerce_score("n/a"))
+        self.assertIsNone(gme._coerce_score(True))     # bools are not scores
+        self.assertIsNone(gme._coerce_score(None))
+
+    def test_flat_scores_are_clamped_in_place(self):
+        bg = {"completeness_a": 7, "completeness_b": "3", "groundedness_a": 5, "groundedness_b": 4}
+        gme._normalize_numeric_scores(bg)
+        self.assertEqual(bg["completeness_a"], 5)
+        self.assertEqual(bg["completeness_b"], 3)
+        self.assertEqual(bg["groundedness_a"], 5)
+
+    def test_nested_and_aliased_scores(self):
+        # Cursor-style nested scores object with varied casing.
+        bg = {"scores": {"completeness": {"a": 4, "b": 2}, "groundedness": {"A": 5, "B": 3}}}
+        gme._normalize_numeric_scores(bg)
+        self.assertEqual(bg["completeness_a"], 4)
+        self.assertEqual(bg["completeness_b"], 2)
+        self.assertEqual(bg["groundedness_a"], 5)
+        self.assertEqual(bg["groundedness_b"], 3)
+
+    def test_missing_scores_stay_absent(self):
+        bg = {"winner": "A"}
+        gme._normalize_numeric_scores(bg)
+        self.assertNotIn("completeness_a", bg)
+        self.assertNotIn("groundedness_b", bg)
+
+    def test_judge_prompt_requests_integer_scores(self):
+        meta = {"id": "Q1", "dept": "Eng", "prompt": "Question?"}
+        run = {"_answer": "answer", "usage": {"input_tokens": 1, "output_tokens": 1}}
+        prompt = gme.judge_prompt(meta, run, run)
+        self.assertIn("completeness_a", prompt)
+        self.assertIn("groundedness_b", prompt)
+        self.assertIn("1-5", prompt)
+
+
 class ServerPresentTest(unittest.TestCase):
     def test_exact_match_from_inventory(self):
         inv = {"servers": ["glean_default"]}
