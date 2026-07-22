@@ -37,6 +37,11 @@ _USAGE_ALIASES = {
 }
 
 
+def _cursor_project_slug(path: Path) -> str:
+    """Return Cursor CLI's filesystem-safe project slug for an absolute path."""
+    return str(path.resolve()).lstrip("/").replace("/", "-")
+
+
 def _load_arm_servers(root: Path, arm_cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Read this arm's mcp_config file and return its mcpServers mapping.
 
@@ -157,6 +162,13 @@ class CursorAdapter(HostAdapter):
             "ws": str(ws),
             "servers": _load_arm_servers(root, arm_cfg),
             "permissions": _permissions_from_arm(arm_cfg),
+            # Cursor stores MCP OAuth tokens/approvals under a project-path
+            # namespace. The eval workspace is intentionally isolated, so stage
+            # the already-authenticated local state into that namespace rather
+            # than putting credentials in the repo or MCP config.
+            "auth_source_dir": str(
+                Path.home() / ".cursor" / "projects" / _cursor_project_slug(root)
+            ),
             "raw_output_path": str(out_dir / "cursor_output.json"),
         }
         return cmd, ctx
@@ -171,6 +183,18 @@ class CursorAdapter(HostAdapter):
         (cdir / "cli.json").write_text(
             json.dumps({"permissions": ctx.get("permissions", {})}, indent=2), encoding="utf-8"
         )
+
+        # OAuth state is kept outside the workspace under ~/.cursor/projects.
+        # Copy only the auth metadata files into the isolated workspace's
+        # project namespace; never write these secrets into the repository.
+        source_dir = Path(ctx.get("auth_source_dir", ""))
+        target_dir = Path.home() / ".cursor" / "projects" / _cursor_project_slug(ws)
+        if source_dir.is_dir():
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for filename in ("mcp-auth.json", "mcp-approvals.json"):
+                source = source_dir / filename
+                if source.exists():
+                    shutil.copy2(source, target_dir / filename)
 
     def harvest(
         self,
@@ -207,13 +231,24 @@ class CursorAdapter(HostAdapter):
                 model = ev.get("model") or model
                 session_id = ev.get("session_id") or ev.get("sessionId") or session_id
             elif etype in ("tool_call", "tool_use"):
-                # TODO(verify): confirm Cursor's tool-call event field names + how the
-                # MCP server is identified so mcp_servers_used is populated correctly.
-                name = str(ev.get("name") or ev.get("tool") or "")
-                server = None
-                if name.startswith("mcp__"):
-                    parts = name.split("__")
-                    server = parts[1] if len(parts) >= 2 else None
+                # Cursor 2026.07 emits MCP calls nested under
+                # tool_call.mcpToolCall.args, with the server and tool names in
+                # serverIdentifier/providerIdentifier and toolName. Preserve the
+                # canonical mcp__server__tool form used by the eval kit while
+                # retaining generic tool-call events for diagnostics.
+                envelope = ev.get("tool_call") or ev.get("toolCall") or {}
+                mcp_call = envelope.get("mcpToolCall") if isinstance(envelope, dict) else None
+                if isinstance(mcp_call, dict):
+                    args = mcp_call.get("args") or {}
+                    server = args.get("serverIdentifier") or args.get("providerIdentifier")
+                    tool = args.get("toolName") or args.get("name")
+                    name = f"mcp__{server}__{tool}" if server and tool else str(tool or "")
+                else:
+                    name = str(ev.get("name") or ev.get("tool") or "")
+                    server = None
+                    if name.startswith("mcp__"):
+                        parts = name.split("__")
+                        server = parts[1] if len(parts) >= 2 else None
                 tool_calls.append({"name": name, "server": server})
             elif etype == "result":
                 answer_text = ev.get("result") or answer_text
