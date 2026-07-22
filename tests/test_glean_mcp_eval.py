@@ -157,6 +157,38 @@ class BlindGradingTest(unittest.TestCase):
         self.assertEqual(g["groundedness_direct"], 5)
 
 
+class JudgeAliasNormalizationTest(unittest.TestCase):
+    def test_winner_prefix_aliases_and_explicit_null(self):
+        # Cursor emitted winner: null plus winner_overall/winner_quality/winner_tokens.
+        bg = {
+            "winner": None,
+            "winner_overall": "B",
+            "winner_quality": "B",
+            "winner_tokens": "A",
+            "efficiency_winner": None,
+        }
+        gme._normalize_judge_aliases(bg)
+        self.assertEqual(bg["winner"], "B")
+        self.assertEqual(bg["efficiency_winner"], "A")
+        self.assertEqual(bg["usefulness_winner"], "B")
+
+    def test_suffix_aliases_and_confidence_bucketing(self):
+        bg = {"overall_winner": "A", "token_efficiency_winner": "tie", "rationale": "because", "confidence": 0.9}
+        gme._normalize_judge_aliases(bg)
+        self.assertEqual(bg["winner"], "A")
+        self.assertEqual(bg["efficiency_winner"], "tie")
+        self.assertEqual(bg["reasoning"], "because")
+        self.assertEqual(bg["confidence"], "high")
+
+    def test_canonical_values_are_preserved(self):
+        bg = {"winner": "A", "efficiency_winner": "B", "reasoning": "keep", "confidence": "low"}
+        gme._normalize_judge_aliases(bg)
+        self.assertEqual(bg["winner"], "A")
+        self.assertEqual(bg["efficiency_winner"], "B")
+        self.assertEqual(bg["reasoning"], "keep")
+        self.assertEqual(bg["confidence"], "low")
+
+
 class ServerPresentTest(unittest.TestCase):
     def test_exact_match_from_inventory(self):
         inv = {"servers": ["glean_default"]}

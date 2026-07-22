@@ -845,6 +845,43 @@ def blind_assignment(participant_id: str, prompt_id: str) -> bool:
     return int(h[:8], 16) % 2 == 0
 
 
+def _pick_alias(bg: Dict[str, Any], *keys: str) -> Any:
+    """Return the first present, non-empty value among keys.
+
+    Schema-free hosts vary key names and sometimes emit an explicit null for the
+    canonical key, so callers treat any falsy value as "missing".
+    """
+    for k in keys:
+        v = bg.get(k)
+        if v not in (None, "", [], {}):
+            return v
+    return None
+
+
+def _normalize_judge_aliases(bg: Dict[str, Any]) -> None:
+    """In-place: map a schema-free judge's output onto the kit's canonical keys.
+
+    Claude Code fills winner/efficiency_winner/reasoning/confidence from the
+    enforced JSON schema. Cursor ignores the schema and emits prose-driven
+    variants (e.g. winner_overall, winner_quality, winner_tokens) and may set
+    winner: null outright, so we fall back on any falsy value rather than only a
+    missing key. Numeric confidence is bucketed to high/medium/low.
+    """
+    if not isinstance(bg, dict):
+        return
+    if not bg.get("winner"):
+        bg["winner"] = _pick_alias(bg, "overall_winner", "winner_overall", "quality_winner", "winner_quality")
+    if not bg.get("efficiency_winner"):
+        bg["efficiency_winner"] = _pick_alias(bg, "token_efficiency_winner", "winner_tokens", "token_winner", "efficiency")
+    if not bg.get("usefulness_winner"):
+        bg["usefulness_winner"] = _pick_alias(bg, "usefulness", "quality_winner", "winner_quality", "winner")
+    if not bg.get("reasoning"):
+        bg["reasoning"] = _pick_alias(bg, "quality_reasoning", "rationale", "explanation", "justification")
+    conf = bg.get("confidence")
+    if not isinstance(conf, bool) and isinstance(conf, (int, float)):
+        bg["confidence"] = "high" if float(conf) >= 0.8 else "medium" if float(conf) >= 0.5 else "low"
+
+
 def deblind_grade(bg: Dict[str, Any], glean_is_a: bool) -> Dict[str, Any]:
     # Translate an A/B judge result back into glean/direct keys so downstream
     # aggregation (collect_aggregate_rows) is unchanged.
@@ -1007,17 +1044,7 @@ def command_grade(args: argparse.Namespace) -> int:
                     except Exception:
                         continue
             if isinstance(blind_grade, dict):
-                if "winner" not in blind_grade:
-                    blind_grade["winner"] = blind_grade.get("overall_winner") or blind_grade.get("quality_winner")
-                if "efficiency_winner" not in blind_grade:
-                    blind_grade["efficiency_winner"] = blind_grade.get("token_efficiency_winner")
-                if "usefulness_winner" not in blind_grade and blind_grade.get("quality_winner"):
-                    blind_grade["usefulness_winner"] = blind_grade["quality_winner"]
-                if "reasoning" not in blind_grade:
-                    blind_grade["reasoning"] = blind_grade.get("quality_reasoning") or blind_grade.get("rationale")
-                if isinstance(blind_grade.get("confidence"), (int, float)):
-                    score = float(blind_grade["confidence"])
-                    blind_grade["confidence"] = "high" if score >= 0.8 else "medium" if score >= 0.5 else "low"
+                _normalize_judge_aliases(blind_grade)
             if not isinstance(blind_grade, dict):
                 failures += 1
                 blind_grade = None
