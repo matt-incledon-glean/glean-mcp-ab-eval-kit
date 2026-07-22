@@ -22,20 +22,72 @@
     "glean": {
       "label": "Glean MCP",
       "mcp_config": "mcp/glean.mcp.json",
-      "expected_mcp_servers": ["glean_default"],
-      "forbidden_mcp_servers": ["atlassian", "plugin-atlassian-atlassian", "slack", "jira", "confluence", "github", "notion", "google_drive", "gmail", "outlook", "zoom"],
-      "allowed_tools": ["mcp__glean_default__search", "mcp__glean_default__read_document", "mcp__glean_default__chat", "mcp__glean_default__employee_search"],
-      "disallowed_tools": ["mcp__glean_default__run_tool", "mcp__glean_default__find_skills", "mcp__glean_default__read_skill_files"],
+      "expected_mcp_servers": [
+        "glean_default"
+      ],
+      "forbidden_mcp_servers": [
+        "atlassian",
+        "plugin-atlassian-atlassian",
+        "slack",
+        "jira",
+        "confluence",
+        "github",
+        "notion",
+        "google_drive",
+        "gmail",
+        "outlook",
+        "zoom"
+      ],
+      "allowed_tools": [
+        "mcp__glean_default__search",
+        "mcp__glean_default__read_document",
+        "mcp__glean_default__chat",
+        "mcp__glean_default__employee_search"
+      ],
+      "disallowed_tools": [
+        "mcp__glean_default__run_tool",
+        "mcp__glean_default__find_skills",
+        "mcp__glean_default__read_skill_files"
+      ],
       "preflight_prompt": "Use the Glean MCP tools to perform a harmless read-only search for a known internal page and return a one-sentence confirmation that retrieval worked."
     },
     "direct": {
       "label": "Atlassian (direct)",
       "mcp_config": "mcp/direct.mcp.json",
-      "expected_mcp_servers": ["atlassian"],
-      "require_live_tool_servers": ["plugin-atlassian-atlassian"],
-      "forbidden_mcp_servers": ["glean_default", "glean"],
-      "allowed_tools": ["mcp__atlassian__search", "mcp__atlassian__getAccessibleAtlassianResources", "mcp__atlassian__getJiraIssue", "mcp__atlassian__getConfluencePage", "mcp__atlassian__searchJiraIssuesUsingJql", "mcp__atlassian__getConfluenceSpaces", "mcp__atlassian__lookupJiraAccountId", "mcp__atlassian__getVisibleJiraProjects", "mcp__atlassian__atlassianUserInfo"],
-      "disallowed_tools": ["mcp__atlassian__addCommentToJiraIssue", "mcp__atlassian__editJiraIssue", "mcp__atlassian__createJiraIssue", "mcp__atlassian__transitionJiraIssue", "mcp__atlassian__addWorklogToJiraIssue", "mcp__atlassian__createIssueLink", "mcp__atlassian__createConfluencePage", "mcp__atlassian__updateConfluencePage", "mcp__atlassian__createConfluenceFooterComment", "mcp__atlassian__createConfluenceInlineComment"],
+      "expected_mcp_servers": [
+        "atlassian"
+      ],
+      "require_live_tool_servers": [
+        "atlassian",
+        "plugin-atlassian-atlassian"
+      ],
+      "forbidden_mcp_servers": [
+        "glean_default",
+        "glean"
+      ],
+      "allowed_tools": [
+        "mcp__atlassian__search",
+        "mcp__atlassian__getAccessibleAtlassianResources",
+        "mcp__atlassian__getJiraIssue",
+        "mcp__atlassian__getConfluencePage",
+        "mcp__atlassian__searchJiraIssuesUsingJql",
+        "mcp__atlassian__getConfluenceSpaces",
+        "mcp__atlassian__lookupJiraAccountId",
+        "mcp__atlassian__getVisibleJiraProjects",
+        "mcp__atlassian__atlassianUserInfo"
+      ],
+      "disallowed_tools": [
+        "mcp__atlassian__addCommentToJiraIssue",
+        "mcp__atlassian__editJiraIssue",
+        "mcp__atlassian__createJiraIssue",
+        "mcp__atlassian__transitionJiraIssue",
+        "mcp__atlassian__addWorklogToJiraIssue",
+        "mcp__atlassian__createIssueLink",
+        "mcp__atlassian__createConfluencePage",
+        "mcp__atlassian__updateConfluencePage",
+        "mcp__atlassian__createConfluenceFooterComment",
+        "mcp__atlassian__createConfluenceInlineComment"
+      ],
       "preflight_prompt": "Use the Atlassian MCP tools to perform a harmless read-only lookup (for example, search for a Confluence page or fetch a Jira issue) and return a one-sentence confirmation that retrieval worked."
     }
   }
