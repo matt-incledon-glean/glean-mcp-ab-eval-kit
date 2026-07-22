@@ -1066,7 +1066,43 @@ def command_grade(args: argparse.Namespace) -> int:
     return 0 if failures == 0 else 1
 
 
-def validity_flags(glean: Dict[str, Any], direct: Dict[str, Any]) -> List[str]:
+def _server_isolation_flags(cfg: Optional[Dict[str, Any]], arm: str, rec: Dict[str, Any]) -> List[str]:
+    """Flag a run whose MCP server usage escaped its arm's isolation.
+
+    Cursor merges the global ~/.cursor/mcp.json and installed plugins into every
+    workspace and cursor-agent has no --strict-mcp-config flag, so an arm can
+    call a server it was never meant to (e.g. the 'direct' arm reaching
+    glean_default, or the 'glean' arm reaching an Atlassian plugin). Those rows
+    are not a valid A/B comparison and must be excluded from headline stats.
+
+    Uses require_live_tool_servers (the real runtime server identifier) when set,
+    else expected_mcp_servers, mirroring the live-preflight check.
+    """
+    out: List[str] = []
+    if not cfg:
+        return out
+    acfg = (cfg.get("arms") or {}).get(arm) or {}
+    used = {
+        normalize_server_name(k)
+        for k in ((rec.get("transcript") or {}).get("mcp_servers_used") or {})
+    }
+    if not used:
+        return out
+    forbidden = {normalize_server_name(x) for x in (acfg.get("forbidden_mcp_servers") or [])}
+    expected = {
+        normalize_server_name(x)
+        for x in (acfg.get("require_live_tool_servers") or acfg.get("expected_mcp_servers") or [])
+    }
+    if used & forbidden:
+        out.append(f"{arm}_forbidden_server")
+    if expected and (used - expected):
+        out.append(f"{arm}_unexpected_server")
+    return out
+
+
+def validity_flags(
+    glean: Dict[str, Any], direct: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None
+) -> List[str]:
     flags = []
     if not glean.get("success"):
         flags.append("glean_run_failed")
@@ -1080,10 +1116,12 @@ def validity_flags(glean: Dict[str, Any], direct: Dict[str, Any]) -> List[str]:
     dm = set((direct.get("transcript") or {}).get("models", {}).keys())
     if gm and dm and gm != dm:
         flags.append("model_mismatch")
+    flags.extend(_server_isolation_flags(cfg, "glean", glean))
+    flags.extend(_server_isolation_flags(cfg, "direct", direct))
     return flags
 
 
-def collect_aggregate_rows(res: Path) -> List[Dict[str, Any]]:
+def collect_aggregate_rows(res: Path, cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     rows = []
     for pdir in participant_dirs(res, None):
         for pid, glean_dir, direct_dir in paired_prompt_dirs(pdir):
@@ -1094,7 +1132,7 @@ def collect_aggregate_rows(res: Path) -> List[Dict[str, Any]]:
             meta = glean.get("_metadata") or direct.get("_metadata") or {}
             grade_path = pdir / "grades" / pid / "grade.json"
             grade = read_json(grade_path).get("grade") if grade_path.exists() else {}
-            flags = validity_flags(glean, direct)
+            flags = validity_flags(glean, direct, cfg)
             gt = int(glean.get("total_tokens") or 0)
             dtok = int(direct.get("total_tokens") or 0)
             gcost = float(glean.get("computed_cost_usd") or 0.0)
@@ -1191,7 +1229,7 @@ def command_report(args: argparse.Namespace) -> int:
     config_path, cfg = load_config(args.config)
     res = results_dir(config_path, cfg)
     res.mkdir(parents=True, exist_ok=True)
-    rows = collect_aggregate_rows(res)
+    rows = collect_aggregate_rows(res, cfg)
     csv_path = res / "aggregate_rows.csv"
     if rows:
         with csv_path.open("w", encoding="utf-8", newline="") as f:
@@ -1331,6 +1369,8 @@ Rows with any of these flags should be reviewed/excluded before executive claims
 - `glean_no_retrieval`
 - `direct_no_retrieval`
 - `model_mismatch`
+- `glean_forbidden_server` / `direct_forbidden_server` (arm called a server on its `forbidden_mcp_servers` list)
+- `glean_unexpected_server` / `direct_unexpected_server` (arm called a server outside `require_live_tool_servers`/`expected_mcp_servers` — cross-arm contamination)
 
 Detailed rows: [`aggregate_rows.csv`](aggregate_rows.csv)
 """

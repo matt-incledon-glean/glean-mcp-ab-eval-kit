@@ -189,6 +189,65 @@ class JudgeAliasNormalizationTest(unittest.TestCase):
         self.assertEqual(bg["confidence"], "low")
 
 
+class ServerIsolationValidityTest(unittest.TestCase):
+    CFG = {
+        "arms": {
+            "glean": {
+                "expected_mcp_servers": ["glean_default"],
+                "forbidden_mcp_servers": ["plugin-atlassian-atlassian", "jira"],
+            },
+            "direct": {
+                "expected_mcp_servers": ["atlassian"],
+                "require_live_tool_servers": ["plugin-atlassian-atlassian"],
+                "forbidden_mcp_servers": ["glean_default", "glean"],
+            },
+        }
+    }
+
+    @staticmethod
+    def _run(servers):
+        return {
+            "success": True,
+            "transcript": {
+                "retrieval_attempted": bool(servers),
+                "mcp_servers_used": servers,
+                "models": {"Opus": 1},
+            },
+        }
+
+    def test_clean_arms_have_no_isolation_flags(self):
+        glean = self._run({"glean_default": 8})
+        direct = self._run({"plugin-atlassian-atlassian": 6})
+        self.assertEqual(gme.validity_flags(glean, direct, self.CFG), [])
+
+    def test_direct_reaching_glean_is_flagged(self):
+        # The real contamination: 'direct' arm used glean_default (forbidden + unexpected).
+        glean = self._run({"glean_default": 8})
+        direct = self._run({"glean_default": 14})
+        flags = gme.validity_flags(glean, direct, self.CFG)
+        self.assertIn("direct_forbidden_server", flags)
+        self.assertIn("direct_unexpected_server", flags)
+        self.assertNotIn("glean_forbidden_server", flags)
+
+    def test_glean_reaching_atlassian_is_flagged(self):
+        glean = self._run({"glean_default": 12, "plugin-atlassian-atlassian": 8})
+        direct = self._run({"plugin-atlassian-atlassian": 6})
+        flags = gme.validity_flags(glean, direct, self.CFG)
+        self.assertIn("glean_forbidden_server", flags)
+        self.assertIn("glean_unexpected_server", flags)
+
+    def test_no_cfg_preserves_legacy_behavior(self):
+        glean = self._run({"glean_default": 8})
+        direct = self._run({"glean_default": 14})
+        self.assertEqual(gme.validity_flags(glean, direct), [])
+
+    def test_no_retrieval_does_not_add_isolation_flag(self):
+        empty = self._run({})
+        flags = gme.validity_flags(empty, empty, self.CFG)
+        self.assertIn("glean_no_retrieval", flags)
+        self.assertNotIn("glean_unexpected_server", flags)
+
+
 class ServerPresentTest(unittest.TestCase):
     def test_exact_match_from_inventory(self):
         inv = {"servers": ["glean_default"]}
