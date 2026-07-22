@@ -1075,8 +1075,9 @@ def _server_isolation_flags(cfg: Optional[Dict[str, Any]], arm: str, rec: Dict[s
     glean_default, or the 'glean' arm reaching an Atlassian plugin). Those rows
     are not a valid A/B comparison and must be excluded from headline stats.
 
-    Uses require_live_tool_servers (the real runtime server identifier) when set,
-    else expected_mcp_servers, mirroring the live-preflight check.
+    Sanctioned servers are expected_mcp_servers UNION require_live_tool_servers,
+    so reaching the target via the workspace mcp.json server or an equivalent
+    plugin both count as clean.
     """
     out: List[str] = []
     if not cfg:
@@ -1089,9 +1090,15 @@ def _server_isolation_flags(cfg: Optional[Dict[str, Any]], arm: str, rec: Dict[s
     if not used:
         return out
     forbidden = {normalize_server_name(x) for x in (acfg.get("forbidden_mcp_servers") or [])}
+    # Sanctioned = expected_mcp_servers UNION require_live_tool_servers: an arm may
+    # legitimately reach its target via the workspace mcp.json server or an
+    # equivalent plugin (e.g. 'atlassian' vs 'plugin-atlassian-atlassian').
     expected = {
         normalize_server_name(x)
-        for x in (acfg.get("require_live_tool_servers") or acfg.get("expected_mcp_servers") or [])
+        for x in (
+            list(acfg.get("expected_mcp_servers") or [])
+            + list(acfg.get("require_live_tool_servers") or [])
+        )
     }
     if used & forbidden:
         out.append(f"{arm}_forbidden_server")

@@ -220,6 +220,13 @@ class ServerIsolationValidityTest(unittest.TestCase):
         direct = self._run({"plugin-atlassian-atlassian": 6})
         self.assertEqual(gme.validity_flags(glean, direct, self.CFG), [])
 
+    def test_direct_via_workspace_atlassian_server_is_clean(self):
+        # After isolation the direct arm reaches the workspace mcp.json 'atlassian'
+        # server (not the plugin); union(expected, require_live) must accept it.
+        glean = self._run({"glean_default": 18})
+        direct = self._run({"atlassian": 30})
+        self.assertEqual(gme.validity_flags(glean, direct, self.CFG), [])
+
     def test_direct_reaching_glean_is_flagged(self):
         # The real contamination: 'direct' arm used glean_default (forbidden + unexpected).
         glean = self._run({"glean_default": 8})
