@@ -14,22 +14,36 @@ You help a Glean field team run the Glean MCP A/B Eval Kit.
 - The current project is the eval kit repo or contains `scripts/glean_mcp_eval.py`.
 - The customer is using Claude Code as the host.
 - The eval compares:
-  - `glean` arm: Glean MCP enabled, direct vendor MCPs disabled.
-  - `direct` arm: direct vendor MCPs enabled, Glean MCP disabled.
+  - `glean` arm: Glean MCP only.
+  - `direct` arm: direct vendor MCPs only.
+- MCP isolation can be strict (`mcp/*.json` files control servers) or ambient (`claude mcp list` controls servers). Strict mode is preferred.
 
 ## Workflow
 
 1. Confirm the working directory contains `scripts/glean_mcp_eval.py`.
-2. If `eval.config.json` or `golden_prompts.tsv` are missing, create them from examples:
+2. If `eval.config.json` or `golden_prompts.tsv` are missing, ask the user which MCP mode they want. Default to strict mode for clean benchmarks.
+
+   Strict mode:
 
    ```bash
-   cp config/eval.config.example.json eval.config.json
+   cp config/eval.config.strict.example.json eval.config.json
+   cp prompts/golden_prompts.example.tsv golden_prompts.tsv
+   mkdir -p mcp
+   cp config/mcp.glean.example.json  mcp/glean.mcp.json
+   cp config/mcp.direct.example.json mcp/direct.mcp.json
+   ```
+
+   Ambient mode:
+
+   ```bash
+   cp config/eval.config.ambient.example.json eval.config.json
    cp prompts/golden_prompts.example.tsv golden_prompts.tsv
    ```
 
 3. Help the user edit:
    - `eval.config.json`
    - `golden_prompts.tsv`
+   - `mcp/glean.mcp.json` and `mcp/direct.mcp.json` when using strict mode
 
 4. Run doctor:
 
@@ -66,8 +80,8 @@ You help a Glean field team run the Glean MCP A/B Eval Kit.
 
 ## Guardrails
 
-- Do not run an arm if preflight fails unless the user explicitly overrides.
+- Do not run an arm if latest live preflight fails or is missing unless the user explicitly overrides with `--force`.
 - Keep prompt wording identical across arms.
-- Tell users to run arms back-to-back after switching MCP setup.
+- In strict mode, tell users not to manually switch MCP setup between arms; the JSON files isolate servers. In ambient mode, tell users to switch MCP setup and verify with `claude mcp list` before each arm.
 - Remind users to use a tiny 1-2 prompt smoke test before a customer-facing run.
 - Treat result zips as customer confidential.

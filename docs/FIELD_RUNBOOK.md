@@ -141,10 +141,22 @@ Open the folder:
 cd /path/to/glean-mcp-ab-eval-kit
 ```
 
-Create editable local files:
+Choose one MCP setup mode, then create editable local files.
+
+**Strict mode, recommended for clean benchmarks:** the eval uses `mcp/*.json` files as the source of truth and does not require manual MCP add/remove between arms.
 
 ```bash
-cp config/eval.config.example.json eval.config.json
+cp config/eval.config.strict.example.json eval.config.json
+cp prompts/golden_prompts.example.tsv golden_prompts.tsv
+mkdir -p mcp
+cp config/mcp.glean.example.json  mcp/glean.mcp.json
+cp config/mcp.direct.example.json mcp/direct.mcp.json
+```
+
+**Ambient mode, easiest for local debugging:** the eval uses whatever appears in `claude mcp list`; users must manually isolate MCPs between arms.
+
+```bash
+cp config/eval.config.ambient.example.json eval.config.json
 cp prompts/golden_prompts.example.tsv golden_prompts.tsv
 ```
 
@@ -152,6 +164,7 @@ Edit:
 
 - `eval.config.json`
 - `golden_prompts.tsv`
+- `mcp/glean.mcp.json` and `mcp/direct.mcp.json` if using strict mode
 
 ## 8. Configure `eval.config.json`
 
@@ -167,7 +180,19 @@ Set the prompt file:
 "prompts_file": "golden_prompts.tsv"
 ```
 
-`config/eval.config.example.json` is the source of truth for arm structure — copy it and adapt. Each arm should set `mcp_config` (per-arm isolation, see section 9), the real server names, and **read-only** tool lists. The shipped example uses `glean_default` (Glean) vs `atlassian` (vendor-direct):
+`config/eval.config.example.json` is the source of truth for arm structure — copy it and adapt. Set `mcp_mode` explicitly:
+
+```json
+"mcp_mode": "strict"
+```
+
+or:
+
+```json
+"mcp_mode": "ambient"
+```
+
+In strict mode, each arm should set `mcp_config` (per-arm isolation, see section 9), the real server names, and **read-only** tool lists. The shipped example uses `glean_default` (Glean) vs direct vendor MCPs:
 
 ```json
 "glean": {
@@ -191,11 +216,14 @@ Set the prompt file:
 }
 ```
 
-Important: server and tool names must match the customer’s Claude Code MCP names. Run `claude mcp list` to confirm servers, and keep `allowed_tools` limited to read/search tools while `disallowed_tools` blocks every write and any arbitrary-dispatch tool (e.g. Glean's `run_tool`) — a read-only eval must never mutate live systems.
+Important: server and tool names must match the customer’s Claude Code MCP names. Run `claude mcp list` to confirm servers. In strict mode, also run `claude mcp get <server>` and mirror any required headers/auth shape into the corresponding `mcp/*.json` file. Keep `allowed_tools` limited to read/search tools while `disallowed_tools` blocks every write and any arbitrary-dispatch tool (e.g. Glean's `run_tool`) — a read-only eval must never mutate live systems.
 
 ```bash
 claude mcp list
+claude mcp get glean_default
 ```
+
+The CLI also blocks local built-ins such as `Bash`, `Read`, `Write`, `WebSearch`, and `WebFetch` by default via `default_disallow_builtin_tools: true`.
 
 ## 9. Smoke-test before involving users
 
@@ -204,6 +232,8 @@ Run:
 ```bash
 python3 scripts/glean_mcp_eval.py doctor --config eval.config.json
 ```
+
+`doctor` now reports the MCP mode per arm, which MCP source will be used, prompt count, and strict-config diagnostics such as placeholder values or missing expected servers. The prompt TSV is validated strictly; malformed rows fail before any eval runs.
 
 Then reduce `golden_prompts.tsv` to one harmless prompt and test both arms.
 
@@ -246,6 +276,8 @@ Open:
 results/aggregate_summary.md
 results/aggregate_rows.csv
 ```
+
+`run` refuses to start unless the latest live preflight passed for that arm. Use `--force` only when intentionally debugging a broken setup.
 
 If this works, restore the full prompt set.
 
@@ -398,8 +430,8 @@ Exclude or manually review rows with:
 
 - `glean_run_failed`
 - `direct_run_failed`
-- `glean_no_retrieval`
-- `direct_no_retrieval`
+- `glean_no_mcp_retrieval`
+- `direct_no_mcp_retrieval`
 - `model_mismatch`
 
 Spot-check several paired answers before claiming quality held constant.
@@ -416,21 +448,45 @@ Claude Code is not installed or not on PATH. Ask the customer to open Claude Cod
 
 ### Preflight says expected MCP server is missing
 
-Run:
+- Strict mode: add the server to the arm's `mcp/*.json` file, or update `expected_mcp_servers` to the exact name in that file.
+- Ambient mode: run `claude mcp list`, enable/add the missing server, or update `expected_mcp_servers` to match the actual server name.
+
+### `claude mcp list` is connected, but strict preflight says no tools are available
+
+Strict mode ignores the user/global server definition except for stored OAuth credentials. Compare the working user server to the strict file:
 
 ```bash
-claude mcp list
+claude mcp get glean_default
+cat mcp/glean.mcp.json
 ```
 
-Then update `expected_mcp_servers` to match the actual server names.
+Mirror required URL/type/headers into `mcp/glean.mcp.json` or switch to ambient mode.
 
 ### Preflight says forbidden server found
 
-The wrong-arm MCP is still configured. Disable it before running that arm.
+- Strict mode: remove the wrong-arm server from the arm's `mcp/*.json` file.
+- Ambient mode: disable/remove the wrong-arm MCP before running that arm.
+
+### Prompt file validation failed
+
+Fix the TSV so every row has the same tab-separated columns as the header. Expected minimum columns:
+
+```text
+ID<TAB>Dept<TAB>Prompt
+```
 
 ### Rows show no retrieval
 
-The model answered from memory or did not call tools. Use more specific prompts that require current internal sources, and ensure MCP tools are allowed.
+The model answered from memory or did not call tools. Use more specific prompts that require current internal sources, and ensure MCP tools are allowed. Live preflight now requires tool use from every expected server.
+
+### Quality scores show `NOT RUN`
+
+Run:
+
+```bash
+python3 scripts/glean_mcp_eval.py grade --config eval.config.json
+python3 scripts/glean_mcp_eval.py report --config eval.config.json
+```
 
 ### Model mismatch
 
@@ -442,13 +498,15 @@ If the customer is comfortable with terminal, this is the smallest instruction b
 
 ```bash
 cd /path/to/glean-mcp-ab-eval-kit
-cp config/eval.config.example.json eval.config.json
+cp config/eval.config.strict.example.json eval.config.json
 cp prompts/golden_prompts.example.tsv golden_prompts.tsv
-# Edit eval.config.json and golden_prompts.tsv
+mkdir -p mcp
+cp config/mcp.glean.example.json  mcp/glean.mcp.json
+cp config/mcp.direct.example.json mcp/direct.mcp.json
+# Edit eval.config.json, golden_prompts.tsv, and mcp/*.json
 python3 scripts/glean_mcp_eval.py doctor --config eval.config.json
 python3 scripts/glean_mcp_eval.py preflight --config eval.config.json --arm glean --live
 python3 scripts/glean_mcp_eval.py run --config eval.config.json --arm glean --participant-id user01
-# Switch MCP setup
 python3 scripts/glean_mcp_eval.py preflight --config eval.config.json --arm direct --live
 python3 scripts/glean_mcp_eval.py run --config eval.config.json --arm direct --participant-id user01
 python3 scripts/glean_mcp_eval.py grade --config eval.config.json --participant-id user01

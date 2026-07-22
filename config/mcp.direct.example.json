@@ -3,6 +3,14 @@
     "atlassian": {
       "type": "sse",
       "url": "https://mcp.atlassian.com/v1/sse"
+    },
+    "slack": {
+      "type": "http",
+      "url": "https://mcp.slack.com/mcp",
+      "oauth": {
+        "clientId": "<REPLACE_WITH_SLACK_MCP_CLIENT_ID_IF_REQUIRED>",
+        "callbackPort": 3118
+      }
     }
   }
 }

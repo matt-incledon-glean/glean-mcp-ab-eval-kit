@@ -85,7 +85,9 @@ commands/                       Plugin slash-command prompts
 scripts/glean_mcp_eval.py       Host-agnostic CLI, orchestration, Claude Code adapter
 scripts/hosts/                  Host adapter contract (base.py) + Cursor adapter (cursor.py)
 bin/glean-mcp-eval              Shell wrapper for zip installs
-config/eval.config.example.json Example customer config
+config/eval.config.example.json Default strict-mode customer config
+config/eval.config.strict.example.json  Strict per-arm MCP config example
+config/eval.config.ambient.example.json Ambient Claude Code MCP config example
 config/mcp.glean.example.json   Per-arm MCP config template (Glean arm)
 config/mcp.direct.example.json  Per-arm MCP config template (vendor-direct arm)
 config/mcp.none.json            Empty MCP config used to isolate the judge
@@ -116,41 +118,54 @@ From the repo root in Claude Code:
 
 If distributing as a zip, unzip it and install from that local path.
 
-### 2. Copy and customize config
+### 2. Choose MCP setup mode, then copy config
+
+Choose **one** MCP setup mode:
+
+| Mode | Source of MCP truth | Manual add/remove between arms? | Best for |
+|---|---|---:|---|
+| `strict` | `mcp/glean.mcp.json` and `mcp/direct.mcp.json` | No | Repeatable benchmark runs |
+| `ambient` | whatever appears in `claude mcp list` | Yes | Quick local debugging |
+
+Strict mode is the default/recommended path:
 
 ```bash
-cp config/eval.config.example.json eval.config.json
+cp config/eval.config.strict.example.json eval.config.json
 cp prompts/golden_prompts.example.tsv golden_prompts.tsv
 mkdir -p mcp
 cp config/mcp.glean.example.json  mcp/glean.mcp.json
 cp config/mcp.direct.example.json mcp/direct.mcp.json
 ```
 
+For ambient mode instead:
+
+```bash
+cp config/eval.config.ambient.example.json eval.config.json
+cp prompts/golden_prompts.example.tsv golden_prompts.tsv
+```
+
 Edit `eval.config.json`:
 
+- Set `mcp_mode` to `strict` or `ambient`.
 - Set `prompts_file` and the `model` to hold constant.
 - For each arm set `expected_mcp_servers`, `forbidden_mcp_servers`, and read-only
   `allowed_tools` / `disallowed_tools`.
 - Optionally set `preflight_prompt`, `pricing_per_million`, `judge_hide_tokens`.
 
-Fill in `mcp/glean.mcp.json` (your Glean MCP URL + token) and `mcp/direct.mcp.json`
-(your vendor MCP). These live under `mcp/`, which is gitignored — they never ship.
+In strict mode, fill in `mcp/glean.mcp.json` and `mcp/direct.mcp.json`. These live
+under `mcp/`, which is gitignored — they never ship. The kit passes
+`--mcp-config <file> --strict-mcp-config`, so each arm executes with exactly its own
+servers regardless of what is installed globally. You do **not** manually enable/disable
+MCPs between arms in strict mode.
 
-#### Arm isolation (preferred)
-
-Each arm sets `mcp_config` pointing to a JSON file that lists **only that arm's**
-MCP servers. Runs then pass `--mcp-config <file> --strict-mcp-config`, so each arm
-executes with exactly its own servers regardless of what is installed globally — **no
-manual enabling/disabling between arms.** This is the recommended, defensible path and
-removes the biggest source of human error.
-
-Manual toggling (disable Glean, enable the vendor MCPs between arms) is only a
-**fallback** for a Claude Code build without `--mcp-config`/`--strict-mcp-config`
-(check with `doctor`).
+In ambient mode, remove/disable the wrong-arm MCPs before each arm and confirm with
+`claude mcp list`; the kit validates that current Claude Code MCP state.
 
 Keep `allowed_tools`/`disallowed_tools` read-only: allow only `search`/`read`/`get*`
 tools and deny writes and any arbitrary-dispatch tool (e.g. Glean's `run_tool`), so a
-read-only eval can never mutate live systems.
+read-only eval can never mutate live systems. Built-in local tools such as `Bash`,
+`Read`, `Write`, `WebSearch`, and `WebFetch` are blocked by default with
+`default_disallow_builtin_tools: true`.
 
 ### 3. Sanity check, then run preflight
 
@@ -177,7 +192,7 @@ For zip installs you can use the wrapper instead:
 bin/glean-mcp-eval preflight --config eval.config.json --arm glean --live
 ```
 
-Preflight checks static MCP config and, with `--live`, runs a harmless Claude Code probe that should call the configured retrieval tools.
+Preflight checks static MCP config and, with `--live`, runs a harmless Claude Code probe that must call every expected MCP server for that arm. `run` refuses to start unless latest live preflight passed; override only for debugging with `--force`.
 
 ### 4. Run an arm
 
@@ -217,10 +232,12 @@ python3 scripts/glean_mcp_eval.py package --config eval.config.json
 
 Outputs:
 
-- `results/aggregate_summary.md`
-- `results/aggregate_rows.csv`
+- `results/aggregate_summary.md` — includes a run-validity banner, MCP usage by row, token/cost/latency rollups, and quality status
+- `results/aggregate_rows.csv` — per-prompt raw rows for analysis
 - `results/submission_manifest.json`
 - `results/eval_submission.zip`
+
+Do not use headline metrics if the summary says `Run validity: FAIL` or if quality grading is marked `NOT RUN` for a quality-sensitive readout.
 
 ## Field runbook
 

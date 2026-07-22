@@ -89,8 +89,14 @@ class ReportTest(unittest.TestCase):
             self.assertEqual(rc, 0)
             summary = (root / "results" / "aggregate_summary.md").read_text(encoding="utf-8")
             self.assertIn("50.0% lower for Glean", summary)
+            self.assertIn("Quality judging: **NOT RUN**", summary)
+            self.assertIn("## MCP usage by row", summary)
             csv_text = (root / "results" / "aggregate_rows.csv").read_text(encoding="utf-8")
             self.assertIn("Q1", csv_text)
+
+    def test_report_negative_savings_wording_is_human_readable(self):
+        self.assertEqual(gme.format_delta(-12.25), "12.2% higher for Glean")
+        self.assertEqual(gme.format_delta(-8.0, positive_word="faster", negative_word="slower"), "8.0% slower for Glean")
 
     def test_import_participant_submission_zip(self):
         with tempfile.TemporaryDirectory() as td:
@@ -114,6 +120,51 @@ class ReportTest(unittest.TestCase):
             rc = gme.main(["import", "--config", str(cfg_path), str(zip_path)])
             self.assertEqual(rc, 0)
             self.assertTrue((root / "results" / "customer01" / "glean" / "Q1" / "run.json").exists())
+
+
+class PromptValidationTest(unittest.TestCase):
+    def test_malformed_tsv_row_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg_path = root / "eval.config.json"
+            cfg_path.write_text(json.dumps({"prompts_file": "golden_prompts.tsv", "arms": {"glean": {}}}), encoding="utf-8")
+            (root / "golden_prompts.tsv").write_text(
+                "ID\tDept\tPrompt\nQ1\tEng\tGood?\nQ2\tSales missing prompt tab\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(gme.EvalError) as cm:
+                gme.load_prompts(cfg_path, json.loads(cfg_path.read_text()))
+            self.assertIn("Prompt file validation failed", str(cm.exception))
+            self.assertIn("line 3", str(cm.exception))
+
+
+class StrictMcpDiagnosticsTest(unittest.TestCase):
+    def test_placeholder_mcp_config_fails_static_validation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mcp = root / "mcp" / "glean.mcp.json"
+            mcp.parent.mkdir()
+            mcp.write_text(json.dumps({
+                "mcpServers": {
+                    "glean_default": {
+                        "type": "http",
+                        "url": "https://<your-glean-subdomain>-be.glean.com/mcp/default",
+                        "headers": {"Authorization": "Bearer <REPLACE_WITH_YOUR_GLEAN_MCP_TOKEN>"},
+                    }
+                }
+            }), encoding="utf-8")
+            cfg = {
+                "mcp_mode": "strict",
+                "arms": {
+                    "glean": {
+                        "mcp_config": "mcp/glean.mcp.json",
+                        "expected_mcp_servers": ["glean_default"],
+                    }
+                },
+            }
+            static = gme.validate_static_setup(root, cfg, "glean")
+            self.assertFalse(static["static_pass"])
+            self.assertTrue(static["strict_config_diagnostics"]["errors"])
 
 
 class BlindGradingTest(unittest.TestCase):
@@ -155,6 +206,14 @@ class BlindGradingTest(unittest.TestCase):
         self.assertEqual(g["completeness_direct"], 4)
         self.assertEqual(g["groundedness_glean"], 3)
         self.assertEqual(g["groundedness_direct"], 5)
+
+
+class ValidityFlagsTest(unittest.TestCase):
+    def test_builtin_tool_call_does_not_count_as_mcp_retrieval(self):
+        glean = {"success": True, "transcript": {"retrieval_attempted": True, "mcp_servers_used": {}, "models": {"m": 1}}}
+        direct = {"success": True, "transcript": {"retrieval_attempted": True, "mcp_servers_used": {"atlassian": 1}, "models": {"m": 1}}}
+        self.assertIn("glean_no_mcp_retrieval", gme.validity_flags(glean, direct))
+        self.assertNotIn("direct_no_mcp_retrieval", gme.validity_flags(glean, direct))
 
 
 class ServerPresentTest(unittest.TestCase):

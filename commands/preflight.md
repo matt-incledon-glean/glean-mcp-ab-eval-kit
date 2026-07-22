@@ -22,9 +22,12 @@ If the user declines live preflight, omit `--live`.
 Report:
 
 - PASS / FAIL
+- MCP mode (`strict` or `ambient`)
+- MCP source (`mcp/*.json` file or ambient `claude mcp list`)
 - missing expected MCP servers
 - forbidden MCP servers found
-- live tool-call evidence, if available
+- strict-config errors/warnings, especially placeholder values or missing headers
+- live tool-call evidence and any `live_missing_required_servers`
 - exact next command to run the arm
 
 Do not continue to `run` if preflight fails unless the user explicitly overrides.

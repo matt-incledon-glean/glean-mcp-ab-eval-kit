@@ -39,6 +39,26 @@ USAGE_KEYS = (
 
 DEFAULT_CONFIG = "eval.config.json"
 
+DEFAULT_DISALLOWED_BUILTINS = [
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "WebSearch",
+    "WebFetch",
+    "NotebookEdit",
+]
+
+PLACEHOLDER_PATTERNS = [
+    "<your-glean-subdomain>",
+    "<replace_with",
+    "example.com",
+    "todo",
+    "changeme",
+]
+
 # CLI flags this kit depends on. `doctor` probes `claude --help` for these so
 # flag drift in a newer/older Claude Code is caught before a customer hits it.
 KIT_CLI_FLAGS = [
@@ -103,27 +123,52 @@ def results_dir(config_path: Path, cfg: Dict[str, Any]) -> Path:
     return (root / cfg.get("results_dir", "results")).resolve()
 
 
-def load_prompts(config_path: Path, cfg: Dict[str, Any]) -> List[Dict[str, str]]:
+def prompt_file_path(config_path: Path, cfg: Dict[str, Any]) -> Path:
     root = repo_root_for_config(config_path)
     prompt_file = Path(cfg.get("prompts_file", "golden_prompts.tsv"))
     if not prompt_file.is_absolute():
         prompt_file = root / prompt_file
+    return prompt_file
+
+
+def load_prompts(config_path: Path, cfg: Dict[str, Any]) -> List[Dict[str, str]]:
+    prompt_file = prompt_file_path(config_path, cfg)
     if not prompt_file.exists():
         raise EvalError(f"Prompts file not found: {prompt_file}")
+    rows: List[Dict[str, str]] = []
+    errors: List[str] = []
     with prompt_file.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f, delimiter="\t")
+        reader = csv.reader(f, delimiter="\t")
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise EvalError(f"Prompt TSV is empty: {prompt_file}")
         required = {"ID", "Prompt"}
-        if not required.issubset(set(reader.fieldnames or [])):
-            raise EvalError(f"Prompt TSV must include columns {sorted(required)}")
-        rows = []
-        for row in reader:
-            if not row.get("ID") or not row.get("Prompt"):
+        if not required.issubset(set(header)):
+            raise EvalError(f"Prompt TSV must include columns {sorted(required)}; found {header}")
+        for line_no, raw in enumerate(reader, 2):
+            if not raw or all(not (c or "").strip() for c in raw):
                 continue
-            rows.append({k: (v or "") for k, v in row.items()})
+            if len(raw) != len(header):
+                errors.append(
+                    f"line {line_no}: expected {len(header)} tab-separated columns ({header}), found {len(raw)}: {raw}"
+                )
+                continue
+            row = {k: (v or "") for k, v in zip(header, raw)}
+            if not row.get("ID", "").strip() or not row.get("Prompt", "").strip():
+                errors.append(f"line {line_no}: ID and Prompt must be non-empty")
+                continue
+            rows.append(row)
+    if errors:
+        preview = "\n".join(errors[:10])
+        more = f"\n... and {len(errors) - 10} more prompt TSV errors" if len(errors) > 10 else ""
+        raise EvalError(
+            f"Prompt file validation failed: {prompt_file}\n{preview}{more}\n\n"
+            "Expected format: ID<TAB>Dept<TAB>Prompt (additional columns are okay if every row has the same column count)."
+        )
     if not rows:
         raise EvalError(f"No prompts found in {prompt_file}")
     return rows
-
 
 def arm_config(cfg: Dict[str, Any], arm: str) -> Dict[str, Any]:
     arms = cfg.get("arms", {})
@@ -280,6 +325,81 @@ def server_present(server: str, inventory: Dict[str, Any], mcp_list: Dict[str, A
     return re.search(r"(?<![a-z0-9_-])" + re.escape(s) + r"(?![a-z0-9_-])", raw) is not None
 
 
+
+def mcp_mode_for_arm(cfg: Dict[str, Any], acfg: Dict[str, Any]) -> str:
+    explicit = str(cfg.get("mcp_mode", "")).strip().lower()
+    if explicit in {"strict", "ambient"}:
+        return explicit
+    return "strict" if acfg.get("mcp_config") else "ambient"
+
+
+def find_placeholder_values(obj: Any, path: str = "$") -> List[Dict[str, str]]:
+    findings: List[Dict[str, str]] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            findings.extend(find_placeholder_values(v, f"{path}.{k}"))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            findings.extend(find_placeholder_values(v, f"{path}[{i}]"))
+    elif isinstance(obj, str):
+        low = obj.lower()
+        for pat in PLACEHOLDER_PATTERNS:
+            if pat in low:
+                findings.append({"path": path, "pattern": pat, "value": obj})
+    return findings
+
+
+def inspect_mcp_config(path: Path, expected_servers: List[str]) -> Dict[str, Any]:
+    diagnostics: Dict[str, Any] = {"path": str(path), "errors": [], "warnings": [], "suggestions": []}
+    if not path.exists():
+        diagnostics["errors"].append("mcp_config file not found")
+        return diagnostics
+    try:
+        data = read_json(path)
+    except Exception as e:  # noqa: BLE001
+        diagnostics["errors"].append(f"could not parse JSON: {e}")
+        return diagnostics
+    placeholders = find_placeholder_values(data)
+    for ph in placeholders:
+        diagnostics["errors"].append(f"placeholder value found at {ph['path']}: {ph['value']}")
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        diagnostics["errors"].append("missing top-level mcpServers object")
+        return diagnostics
+    normalized_to_name = {normalize_server_name(k): k for k in servers.keys()}
+    for exp in expected_servers:
+        if exp not in normalized_to_name:
+            diagnostics["errors"].append(f"expected server {exp!r} is not present in mcp_config")
+    for norm, original in normalized_to_name.items():
+        scfg = servers.get(original) or {}
+        url = str(scfg.get("url") or "") if isinstance(scfg, dict) else ""
+        headers = scfg.get("headers") if isinstance(scfg, dict) else None
+        if "glean.com/mcp" in url and isinstance(headers, dict) and "Authorization" in headers:
+            diagnostics["warnings"].append(
+                f"server {original!r} uses an inline Authorization header; avoid committing MCP tokens/secrets"
+            )
+        if "glean.com/mcp" in url and not isinstance(headers, dict):
+            diagnostics["warnings"].append(
+                f"server {original!r} is a Glean MCP endpoint with no headers; some enterprise environments require environment-specific headers"
+            )
+            diagnostics["suggestions"].append(
+                f"If live preflight exposes no tools, run `claude mcp get {original}` and mirror any required URL/type/headers into this strict MCP config."
+            )
+    return diagnostics
+
+
+def dedupe_preserve(items: Iterable[Any]) -> List[Any]:
+    out = []
+    seen = set()
+    for item in items:
+        key = str(item)
+        if key in seen:
+            continue
+        out.append(item)
+        seen.add(key)
+    return out
+
+
 def inventory_from_file(path: Path) -> Dict[str, Any]:
     counts: Counter = Counter()
     errors = []
@@ -296,33 +416,43 @@ def inventory_from_file(path: Path) -> Dict[str, Any]:
 
 def validate_static_setup(root: Path, cfg: Dict[str, Any], arm: str) -> Dict[str, Any]:
     acfg = arm_config(cfg, arm)
-    mcp_config_path = resolve_mcp_config(root, acfg)
-    if mcp_config_path is not None:
+    mode = mcp_mode_for_arm(cfg, acfg)
+    mcp_config_path = resolve_mcp_config(root, acfg, cfg)
+    expected = [normalize_server_name(x) for x in acfg.get("expected_mcp_servers", [])]
+    forbidden = [normalize_server_name(x) for x in acfg.get("forbidden_mcp_servers", [])]
+    strict_diagnostics: Dict[str, Any] = {"errors": [], "warnings": [], "suggestions": []}
+    if mode == "strict" and mcp_config_path is None:
+        inventory = {"servers": [], "files": [], "errors": [{"path": "", "error": "strict MCP mode requires arm.mcp_config"}]}
+        mcp_list = {"available": None, "strict_mode": True, "mcp_config": None, "servers_hint": [], "raw": None}
+        strict_diagnostics["errors"].append("strict MCP mode requires this arm to set mcp_config")
+    elif mcp_config_path is not None:
         # Strict per-arm isolation: at runtime the arm uses --strict-mcp-config,
         # so the only servers that exist are those in this file. Validate against
         # the file, not the ambient config (which would include the other arm's).
         inventory = inventory_from_file(mcp_config_path)
+        strict_diagnostics = inspect_mcp_config(mcp_config_path, expected)
         mcp_list = {"available": None, "strict_mode": True, "mcp_config": str(mcp_config_path), "servers_hint": [], "raw": None}
     else:
         inventory = static_mcp_inventory(root)
         mcp_list = claude_mcp_list(root)
-    expected = [normalize_server_name(x) for x in acfg.get("expected_mcp_servers", [])]
-    forbidden = [normalize_server_name(x) for x in acfg.get("forbidden_mcp_servers", [])]
     missing = [s for s in expected if not server_present(s, inventory, mcp_list)]
     forbidden_found = [s for s in forbidden if server_present(s, inventory, mcp_list)]
     return {
         "arm": arm,
+        "mcp_mode": mode,
         "expected_mcp_servers": expected,
         "forbidden_mcp_servers": forbidden,
         "configured_inventory": inventory,
         "claude_mcp_list": mcp_list,
+        "strict_config_diagnostics": strict_diagnostics,
         "missing_expected": missing,
         "forbidden_found": forbidden_found,
-        "static_pass": not missing and not forbidden_found,
+        "static_pass": not missing and not forbidden_found and not strict_diagnostics.get("errors"),
     }
 
-
-def resolve_mcp_config(root: Path, acfg: Dict[str, Any]) -> Optional[Path]:
+def resolve_mcp_config(root: Path, acfg: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) -> Optional[Path]:
+    if cfg is not None and str(cfg.get("mcp_mode", "")).strip().lower() == "ambient" and not acfg.get("_force_mcp_config"):
+        return None
     mcp_config = acfg.get("mcp_config")
     if not mcp_config:
         return None
@@ -330,7 +460,6 @@ def resolve_mcp_config(root: Path, acfg: Dict[str, Any]) -> Optional[Path]:
     if not p.is_absolute():
         p = root / p
     return p
-
 
 def build_claude_command(
     root: Path,
@@ -356,7 +485,7 @@ def build_claude_command(
     permission_mode = cfg.get("permission_mode")
     if permission_mode:
         cmd.extend(["--permission-mode", str(permission_mode)])
-    mcp_config_path = resolve_mcp_config(root, acfg)
+    mcp_config_path = resolve_mcp_config(root, acfg, cfg)
     if mcp_config_path is not None:
         # Load ONLY this arm's servers and ignore any ambient/global MCP config,
         # so the arms are provably isolated regardless of what else is installed.
@@ -365,7 +494,10 @@ def build_claude_command(
     if allowed_tools:
         # Claude Code accepts a comma-separated allow list in current releases.
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])
-    disallowed_tools = acfg.get("disallowed_tools") or []
+    disallowed_tools = list(acfg.get("disallowed_tools") or [])
+    if cfg.get("default_disallow_builtin_tools", True):
+        disallowed_tools.extend(DEFAULT_DISALLOWED_BUILTINS)
+    disallowed_tools = dedupe_preserve(disallowed_tools)
     if disallowed_tools:
         # Deny rules take precedence over allow rules — a hard block for
         # write-capable and arbitrary-dispatch tools (e.g. Glean's run_tool)
@@ -683,8 +815,11 @@ def command_preflight(args: argparse.Namespace) -> int:
         )
         observed = set((live_record.get("transcript") or {}).get("mcp_servers_used", {}).keys())
         required = set(normalize_server_name(x) for x in acfg.get("require_live_tool_servers", acfg.get("expected_mcp_servers", [])))
-        # For live preflight, require successful run and at least some required retrieval evidence.
-        live_pass = bool(live_record.get("success")) and (not required or bool(observed & required))
+        missing_live_required = sorted(required - observed)
+        # For live preflight, require successful run and tool use from every required/expected server.
+        live_pass = bool(live_record.get("success")) and (not required or not missing_live_required)
+    else:
+        missing_live_required = []
     overall_pass = bool(static.get("static_pass")) and (live_pass is not False)
     record = {
         "created_at": now_iso(),
@@ -694,22 +829,28 @@ def command_preflight(args: argparse.Namespace) -> int:
         "static": static,
         "live_enabled": bool(args.live),
         "live_pass": live_pass,
+        "live_missing_required_servers": missing_live_required,
         "live_record": live_record,
         "pass": overall_pass,
     }
+    summary = {
+        "pass": overall_pass,
+        "mcp_mode": static.get("mcp_mode"),
+        "mcp_source": (static.get("claude_mcp_list") or {}).get("mcp_config") or "ambient claude mcp list",
+        "missing_expected": static.get("missing_expected"),
+        "forbidden_found": static.get("forbidden_found"),
+        "strict_config_errors": (static.get("strict_config_diagnostics") or {}).get("errors", []),
+        "strict_config_warnings": (static.get("strict_config_diagnostics") or {}).get("warnings", []),
+        "live_pass": live_pass,
+        "live_missing_required_servers": missing_live_required,
+    }
     if args.dry_run:
-        print(json.dumps({"dry_run": True, "arm": args.arm, "static_pass": static.get("static_pass")}, indent=2))
+        print(json.dumps({"dry_run": True, "arm": args.arm, **summary}, indent=2))
         return 0
     write_json(out / "preflight.json", record)
     latest = results_dir(config_path, cfg) / "_preflight" / args.arm / "latest.json"
     write_json(latest, record)
-    print(json.dumps({
-        "pass": overall_pass,
-        "preflight_path": str(out / "preflight.json"),
-        "missing_expected": static.get("missing_expected"),
-        "forbidden_found": static.get("forbidden_found"),
-        "live_pass": live_pass,
-    }, indent=2))
+    print(json.dumps({"preflight_path": str(out / "preflight.json"), **summary}, indent=2))
     return 0 if overall_pass else 2
 
 
@@ -730,12 +871,56 @@ def render_wrapper(wrapper: str, row: Dict[str, str]) -> str:
     return out
 
 
+
+def latest_preflight_path(config_path: Path, cfg: Dict[str, Any], arm: str) -> Path:
+    return results_dir(config_path, cfg) / "_preflight" / arm / "latest.json"
+
+
+def require_passing_preflight(config_path: Path, cfg: Dict[str, Any], arm: str) -> None:
+    if not cfg.get("require_preflight_before_run", True):
+        return
+    p = latest_preflight_path(config_path, cfg, arm)
+    if not p.exists():
+        raise EvalError(
+            f"Cannot run arm {arm!r}: no latest preflight found at {p}. "
+            f"Run: python3 scripts/glean_mcp_eval.py preflight --config {config_path.name} --arm {arm} --live "
+            "or rerun with --force."
+        )
+    rec = read_json(p)
+    if rec.get("pass") is not True:
+        static = rec.get("static") or {}
+        reasons = []
+        if static.get("missing_expected"):
+            reasons.append(f"missing expected MCP servers: {static.get('missing_expected')}")
+        if static.get("forbidden_found"):
+            reasons.append(f"forbidden MCP servers present: {static.get('forbidden_found')}")
+        diag = static.get("strict_config_diagnostics") or {}
+        if diag.get("errors"):
+            reasons.extend(diag.get("errors"))
+        if rec.get("live_pass") is False:
+            reasons.append("live preflight failed")
+        if rec.get("live_missing_required_servers"):
+            reasons.append(f"live preflight did not use required servers: {rec.get('live_missing_required_servers')}")
+        reason_text = "; ".join(reasons) if reasons else "preflight pass=false"
+        raise EvalError(
+            f"Cannot run arm {arm!r}: latest preflight failed ({reason_text}). "
+            "Fix setup and rerun preflight, or rerun run with --force."
+        )
+    if cfg.get("require_live_preflight_before_run", True) and not rec.get("live_enabled"):
+        raise EvalError(
+            f"Cannot run arm {arm!r}: latest preflight did not include --live. "
+            "Rerun preflight with --live, or rerun run with --force."
+        )
+
+
 def command_run(args: argparse.Namespace) -> int:
     config_path, cfg = load_config(args.config)
     root = repo_root_for_config(config_path)
     acfg = arm_config(cfg, args.arm)
     host = getattr(args, "host", None) or cfg.get("host") or "claude-code"
     prompts = load_prompts(config_path, cfg)
+    if not args.force and not args.dry_run:
+        require_passing_preflight(config_path, cfg, args.arm)
     out_root = results_dir(config_path, cfg) / args.participant_id / args.arm
     wrapper = cfg.get("prompt_wrapper") or "{prompt}"
     manifest = {
@@ -951,6 +1136,7 @@ def command_grade(args: argparse.Namespace) -> int:
         "allowed_tools": [],
         "disallowed_tools": cfg.get("judge_disallowed_tools", ["Bash", "Write", "Edit", "NotebookEdit"]),
         "mcp_config": cfg.get("judge_mcp_config", "config/mcp.none.json"),
+        "_force_mcp_config": True,
     }
     for pdir in participants:
         for pid, glean_dir, direct_dir in paired_prompt_dirs(pdir):
@@ -1016,10 +1202,10 @@ def validity_flags(glean: Dict[str, Any], direct: Dict[str, Any]) -> List[str]:
         flags.append("glean_run_failed")
     if not direct.get("success"):
         flags.append("direct_run_failed")
-    if not (glean.get("transcript") or {}).get("retrieval_attempted"):
-        flags.append("glean_no_retrieval")
-    if not (direct.get("transcript") or {}).get("retrieval_attempted"):
-        flags.append("direct_no_retrieval")
+    if not (glean.get("transcript") or {}).get("mcp_servers_used"):
+        flags.append("glean_no_mcp_retrieval")
+    if not (direct.get("transcript") or {}).get("mcp_servers_used"):
+        flags.append("direct_no_mcp_retrieval")
     gm = set((glean.get("transcript") or {}).get("models", {}).keys())
     dm = set((direct.get("transcript") or {}).get("models", {}).keys())
     if gm and dm and gm != dm:
@@ -1124,6 +1310,51 @@ def bootstrap_savings_ci(pairs: List[Tuple[Any, Any]], n_boot: int = 2000, seed:
     return (round(ests[int(0.025 * (len(ests) - 1))], 1), round(ests[int(0.975 * (len(ests) - 1))], 1))
 
 
+def format_delta(savings_pct: float, *, positive_word: str = "lower", negative_word: str = "higher") -> str:
+    if savings_pct >= 0:
+        return f"{savings_pct:.1f}% {positive_word} for Glean"
+    return f"{abs(savings_pct):.1f}% {negative_word} for Glean"
+
+
+def preflight_report_lines(config_path: Path, cfg: Dict[str, Any]) -> Tuple[List[str], bool]:
+    lines = []
+    all_pass = True
+    for arm in sorted((cfg.get("arms") or {}).keys()):
+        p = latest_preflight_path(config_path, cfg, arm)
+        if not p.exists():
+            all_pass = False
+            lines.append(f"❌ {arm}: no latest preflight found")
+            continue
+        try:
+            rec = read_json(p)
+        except Exception as e:  # noqa: BLE001
+            all_pass = False
+            lines.append(f"❌ {arm}: could not read latest preflight ({e})")
+            continue
+        static = rec.get("static") or {}
+        mode = static.get("mcp_mode") or "unknown"
+        source = ((static.get("claude_mcp_list") or {}).get("mcp_config") or "ambient claude mcp list")
+        if rec.get("pass") is True:
+            lines.append(f"✅ {arm}: preflight passed ({mode}; {source})")
+        else:
+            all_pass = False
+            bits = []
+            if static.get("missing_expected"):
+                bits.append(f"missing expected {static.get('missing_expected')}")
+            if static.get("forbidden_found"):
+                bits.append(f"forbidden found {static.get('forbidden_found')}")
+            if rec.get("live_pass") is False:
+                bits.append("live failed")
+            if rec.get("live_missing_required_servers"):
+                bits.append(f"live missing {rec.get('live_missing_required_servers')}")
+            diag = static.get("strict_config_diagnostics") or {}
+            if diag.get("errors"):
+                bits.append(f"strict config errors {diag.get('errors')}")
+            suffix = "; ".join(bits) if bits else "pass=false"
+            lines.append(f"❌ {arm}: preflight failed ({mode}; {suffix})")
+    return lines, all_pass
+
+
 def command_report(args: argparse.Namespace) -> int:
     config_path, cfg = load_config(args.config)
     res = results_dir(config_path, cfg)
@@ -1146,27 +1377,25 @@ def command_report(args: argparse.Namespace) -> int:
     def pct_lower(direct_val: float, glean_val: float) -> float:
         return ((direct_val - glean_val) / direct_val * 100.0) if direct_val else 0.0
 
-    # Tokens: marginal = per-prompt work (input+output); fixed = per-session cache creation.
     g_marg_avg = col_mean("glean_marginal_tokens")
     d_marg_avg = col_mean("direct_marginal_tokens")
     g_fixed_avg = col_mean("glean_cache_write_tokens")
     d_fixed_avg = col_mean("direct_cache_write_tokens")
     gt_avg = col_mean("glean_total_tokens")
     dt_avg = col_mean("direct_total_tokens")
-    # Cost: reported = Claude Code's own per-run figure (primary); list = normalized rate card.
     g_rc_avg = col_mean("glean_reported_cost_usd")
     d_rc_avg = col_mean("direct_reported_cost_usd")
     gc_avg = col_mean("glean_cost_usd")
     dc_avg = col_mean("direct_cost_usd")
-    # Latency: wall-clock milliseconds reported by Claude Code.
     g_lat_avg = col_mean("glean_latency_ms")
     d_lat_avg = col_mean("direct_latency_ms")
 
     winner_counts = Counter(r.get("winner") or "ungraded" for r in denom_rows)
-    comp_g = col_mean("completeness_glean")
-    comp_d = col_mean("completeness_direct")
-    gr_g = col_mean("groundedness_glean")
-    gr_d = col_mean("groundedness_direct")
+    quality_ran = bool(denom_rows) and any((r.get("winner") or "") not in ("", "ungraded") for r in denom_rows)
+    comp_g = col_mean("completeness_glean") if quality_ran else 0.0
+    comp_d = col_mean("completeness_direct") if quality_ran else 0.0
+    gr_g = col_mean("groundedness_glean") if quality_ran else 0.0
+    gr_d = col_mean("groundedness_direct") if quality_ran else 0.0
 
     marginal_savings = pct_lower(d_marg_avg, g_marg_avg)
     total_token_savings = pct_lower(dt_avg, gt_avg)
@@ -1182,12 +1411,61 @@ def command_report(args: argparse.Namespace) -> int:
 
     reported_cost_ci = bootstrap_savings_ci([(r["glean_reported_cost_usd"], r["direct_reported_cost_usd"]) for r in denom_rows])
     marginal_ci = bootstrap_savings_ci([(r["glean_marginal_tokens"], r["direct_marginal_tokens"]) for r in denom_rows])
+    preflight_lines, preflights_pass = preflight_report_lines(config_path, cfg)
+    invalid_run = (not rows) or invalid_count > 0 or not preflights_pass
+    validity_status = "FAIL — do not use headline metrics" if invalid_run else "PASS"
+    if not invalid_run and not quality_ran:
+        validity_status = "PASS with warning — quality grading not run"
+
+    mcp_usage_lines = ["| Prompt | Glean MCP usage | Direct MCP usage | Valid |", "|---|---|---|---|"]
+    for r in rows:
+        mcp_usage_lines.append(
+            f"| {r.get('query_id')} | `{r.get('glean_mcp_servers_used')}` | `{r.get('direct_mcp_servers_used')}` | {'✅' if r.get('valid') else '❌ ' + str(r.get('validity_flags'))} |"
+        )
+    mcp_usage_md = "\n".join(mcp_usage_lines) if rows else "No paired rows found."
+
+    quality_md = (
+        "## Quality judge summary\n\n"
+        "Quality judging: **NOT RUN**\n\n"
+        "Run:\n\n"
+        "```bash\n"
+        "python3 scripts/glean_mcp_eval.py grade --config eval.config.json\n"
+        "python3 scripts/glean_mcp_eval.py report --config eval.config.json\n"
+        "```\n"
+    )
+    if quality_ran:
+        quality_md = f"""## Quality judge summary
+
+| Metric | Glean MCP | Direct MCP |
+|---|---:|---:|
+| Avg completeness | {comp_g:.2f} | {comp_d:.2f} |
+| Avg groundedness | {gr_g:.2f} | {gr_d:.2f} |
+
+Winner counts: `{dict(winner_counts)}`
+"""
+
+    warning_md = ""
+    if invalid_run:
+        warning_md = (
+            "\n> ⚠️ Headline metrics should not be used for executive/customer claims until validity issues are fixed. "
+            "The tables below are included for debugging only.\n"
+        )
+
     md = f"""# Aggregate summary
 
 Generated: {now_iso()}
 
 Eval: `{cfg.get('eval_name', '')}`
 
+## Run validity
+
+**{validity_status}**
+
+""" + "\n".join(f"- {line}" for line in preflight_lines) + f"""
+- {'✅' if rows else '❌'} Paired rows found: {len(rows)}
+- {'✅' if invalid_count == 0 and rows else '❌'} Invalid / flagged rows: {invalid_count}
+- {'✅' if quality_ran else '⚠️'} Quality grading: {'run' if quality_ran else 'not run'}
+{warning_md}
 ## Dataset
 
 - Paired rows: {len(rows)}
@@ -1195,14 +1473,18 @@ Eval: `{cfg.get('eval_name', '')}`
 - Invalid / flagged rows: {invalid_count}
 - Summary basis: {'valid rows' if valid else 'all rows (no fully valid rows found)'}
 
+## MCP usage by row
+
+{mcp_usage_md}
+
 ## Cost
 
 Primary metric is the cost Claude Code reports per run. List-price-normalized cost applies the configurable `pricing_per_million` rates uniformly across both arms.
 
 | Metric | Glean MCP | Direct MCP | Delta |
 |---|---:|---:|---:|
-| Avg reported cost / task | ${g_rc_avg:,.4f} | ${d_rc_avg:,.4f} | {reported_cost_savings:.1f}% lower for Glean |
-| Avg list-price-normalized cost / task | ${gc_avg:,.4f} | ${dc_avg:,.4f} | {list_cost_savings:.1f}% lower for Glean |
+| Avg reported cost / task | ${g_rc_avg:,.4f} | ${d_rc_avg:,.4f} | {format_delta(reported_cost_savings)} |
+| Avg list-price-normalized cost / task | ${gc_avg:,.4f} | ${dc_avg:,.4f} | {format_delta(list_cost_savings)} |
 
 > List-price-normalized cost is a rate-card comparison, not billed spend. Verify `pricing_per_million` against current model list prices; it can diverge sharply from reported cost when cache-creation tokens dominate.
 >
@@ -1214,9 +1496,9 @@ Marginal = per-prompt work (input + output). Fixed = per-session cache creation 
 
 | Metric | Glean MCP | Direct MCP | Delta |
 |---|---:|---:|---:|
-| Avg marginal tokens / task | {g_marg_avg:,.0f} | {d_marg_avg:,.0f} | {marginal_savings:.1f}% lower for Glean |
+| Avg marginal tokens / task | {g_marg_avg:,.0f} | {d_marg_avg:,.0f} | {format_delta(marginal_savings)} |
 | Avg fixed (cache-creation) tokens / task | {g_fixed_avg:,.0f} | {d_fixed_avg:,.0f} | — |
-| Avg total tokens / task | {gt_avg:,.0f} | {dt_avg:,.0f} | {total_token_savings:.1f}% lower for Glean |
+| Avg total tokens / task | {gt_avg:,.0f} | {dt_avg:,.0f} | {format_delta(total_token_savings)} |
 
 > Prefer marginal tokens + reported cost for headline claims. Raw totals are dominated by per-session cache creation and can mislead.
 >
@@ -1226,25 +1508,17 @@ Marginal = per-prompt work (input + output). Fixed = per-session cache creation 
 
 | Metric | Glean MCP | Direct MCP | Delta |
 |---|---:|---:|---:|
-| Avg wall-clock / task | {g_lat_avg / 1000:,.1f}s | {d_lat_avg / 1000:,.1f}s | {latency_savings:.1f}% faster for Glean |
+| Avg wall-clock / task | {g_lat_avg / 1000:,.1f}s | {d_lat_avg / 1000:,.1f}s | {format_delta(latency_savings, positive_word='faster', negative_word='slower')} |
 
-## Quality judge summary
-
-| Metric | Glean MCP | Direct MCP |
-|---|---:|---:|
-| Avg completeness | {comp_g:.2f} | {comp_d:.2f} |
-| Avg groundedness | {gr_g:.2f} | {gr_d:.2f} |
-
-Winner counts: `{dict(winner_counts)}`
-
+{quality_md}
 ## Validity notes
 
 Rows with any of these flags should be reviewed/excluded before executive claims:
 
 - `glean_run_failed`
 - `direct_run_failed`
-- `glean_no_retrieval`
-- `direct_no_retrieval`
+- `glean_no_mcp_retrieval`
+- `direct_no_mcp_retrieval`
 - `model_mismatch`
 
 Detailed rows: [`aggregate_rows.csv`](aggregate_rows.csv)
@@ -1256,6 +1530,7 @@ Detailed rows: [`aggregate_rows.csv`](aggregate_rows.csv)
         "valid_rows": len(valid),
         "aggregate_rows_csv": str(csv_path),
         "aggregate_summary_md": str(summary_path),
+        "run_validity": validity_status,
         "avg_marginal_token_savings_pct": round(marginal_savings, 2),
         "avg_total_token_savings_pct": round(total_token_savings, 2),
         "avg_reported_cost_savings_pct": round(reported_cost_savings, 2),
@@ -1265,7 +1540,6 @@ Detailed rows: [`aggregate_rows.csv`](aggregate_rows.csv)
         "marginal_token_savings_ci_pct": marginal_ci,
     }, indent=2))
     return 0
-
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -1366,6 +1640,8 @@ def command_doctor(args: argparse.Namespace) -> int:
         "host": host,
         "host_executable_present": adapter.executable_present(),
         "caps": adapter.caps,
+        "mcp_mode_by_arm": {arm: mcp_mode_for_arm(cfg, acfg) for arm, acfg in (cfg.get("arms") or {}).items()},
+        "arm_static_checks": {arm: validate_static_setup(root, cfg, arm) for arm in (cfg.get("arms") or {}).keys()},
         "prompts_count": len(load_prompts(config_path, cfg)),
         "results_dir": str(results_dir(config_path, cfg)),
     }
@@ -1403,7 +1679,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_host(sp)
     sp.add_argument("--arm", required=True, help="Arm name from config, e.g. glean or direct")
     sp.add_argument("--participant-id", required=True, help="Stable anonymous participant ID")
-    sp.add_argument("--dry-run", action="store_true", help="Print the exact commands without executing")
+    sp.add_argument("--dry-run", action="store_true", help="Print the exact host commands without executing")
+    sp.add_argument("--force", action="store_true", help="Run even if latest live preflight is missing or failed")
     sp.set_defaults(func=command_run)
 
     sp = sub.add_parser("grade", help="Judge paired Glean/direct answers")

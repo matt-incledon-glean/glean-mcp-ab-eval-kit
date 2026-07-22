@@ -1,12 +1,10 @@
 {
   "eval_name": "customer-glean-mcp-ab-eval",
-  "host": "claude-code",
-  "mcp_mode": "strict",
+  "mcp_mode": "ambient",
   "prompts_file": "golden_prompts.tsv",
   "results_dir": "results",
   "model": "opus",
   "judge_model": "opus",
-  "judge_host": "claude-code",
   "judge_mcp_config": "config/mcp.none.json",
   "judge_hide_tokens": false,
   "max_turns": 20,
@@ -25,7 +23,6 @@
   "arms": {
     "glean": {
       "label": "Glean MCP",
-      "mcp_config": "mcp/glean.mcp.json",
       "expected_mcp_servers": ["glean_default"],
       "forbidden_mcp_servers": ["atlassian", "slack", "jira", "confluence", "github", "notion", "google_drive", "gmail", "outlook", "zoom"],
       "allowed_tools": ["mcp__glean_default__search", "mcp__glean_default__read_document", "mcp__glean_default__chat", "mcp__glean_default__employee_search"],
@@ -34,7 +31,6 @@
     },
     "direct": {
       "label": "Atlassian + Slack (direct)",
-      "mcp_config": "mcp/direct.mcp.json",
       "expected_mcp_servers": ["atlassian", "slack"],
       "forbidden_mcp_servers": ["glean_default", "glean"],
       "allowed_tools": [
@@ -43,10 +39,6 @@
         "mcp__atlassian__getJiraIssue",
         "mcp__atlassian__getConfluencePage",
         "mcp__atlassian__searchJiraIssuesUsingJql",
-        "mcp__atlassian__getConfluenceSpaces",
-        "mcp__atlassian__lookupJiraAccountId",
-        "mcp__atlassian__getVisibleJiraProjects",
-        "mcp__atlassian__atlassianUserInfo",
         "mcp__slack__slack_search_public",
         "mcp__slack__slack_search_public_and_private",
         "mcp__slack__slack_search_channels",
@@ -59,12 +51,6 @@
         "mcp__atlassian__editJiraIssue",
         "mcp__atlassian__createJiraIssue",
         "mcp__atlassian__transitionJiraIssue",
-        "mcp__atlassian__addWorklogToJiraIssue",
-        "mcp__atlassian__createIssueLink",
-        "mcp__atlassian__createConfluencePage",
-        "mcp__atlassian__updateConfluencePage",
-        "mcp__atlassian__createConfluenceFooterComment",
-        "mcp__atlassian__createConfluenceInlineComment",
         "mcp__slack__slack_send_message",
         "mcp__slack__slack_schedule_message",
         "mcp__slack__slack_send_message_draft"
