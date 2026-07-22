@@ -235,6 +235,49 @@ class CursorServerIsolationTest(unittest.TestCase):
         self.assertNotIn("--approve-mcps", cmd)  # dropped: it defeats isolation
         self.assertEqual(ctx["disabled_servers"], ["plugin-atlassian-atlassian"])
 
+    def test_prepare_strips_approvals_for_disabled_servers(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / ".cursor").mkdir(parents=True)
+            ws = Path(tmp) / "run" / "_cursor_ws"
+            ws.mkdir(parents=True)
+            src = Path(tmp) / "src"
+            src.mkdir()
+            (src / "mcp-auth.json").write_text("{}", encoding="utf-8")
+            (src / "mcp-approvals.json").write_text(
+                json.dumps([
+                    "glean_default-abc",
+                    "plugin-atlassian-atlassian-abc",
+                    "atlassian-abc",
+                ]),
+                encoding="utf-8",
+            )
+            ctx = {
+                "ws": str(ws),
+                "servers": {},
+                "permissions": {},
+                "auth_source_dir": str(src),
+                "disabled_servers": ["plugin-atlassian-atlassian", "plugin-glean-vnext-glean"],
+            }
+            adapter = cursor_host.CursorAdapter()
+            with mock.patch.object(cursor_host.Path, "home", return_value=home):
+                adapter.prepare(ctx)
+            slug = cursor_host._cursor_project_slug(ws)
+            staged = json.loads(
+                (home / ".cursor" / "projects" / slug / "mcp-approvals.json").read_text()
+            )
+            self.assertIn("glean_default-abc", staged)       # sanctioned kept
+            self.assertIn("atlassian-abc", staged)           # not disabled, kept
+            self.assertNotIn("plugin-atlassian-atlassian-abc", staged)  # disabled -> stripped
+            disabled = json.loads(
+                (home / ".cursor" / "projects" / slug / "mcp-disabled.json").read_text()
+            )
+            self.assertEqual(
+                sorted(disabled),
+                ["plugin-atlassian-atlassian", "plugin-glean-vnext-glean"],
+            )
+
 
 class ServerPresentTest(unittest.TestCase):
     def test_exact_match_from_inventory(self):

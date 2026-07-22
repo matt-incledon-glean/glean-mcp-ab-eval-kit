@@ -297,11 +297,33 @@ class CursorAdapter(HostAdapter):
         source_dir = Path(ctx.get("auth_source_dir", ""))
         target_dir = Path.home() / ".cursor" / "projects" / _cursor_project_slug(ws)
         target_dir.mkdir(parents=True, exist_ok=True)
+        disabled = list(ctx.get("disabled_servers") or [])
         if source_dir.is_dir():
-            for filename in ("mcp-auth.json", "mcp-approvals.json"):
-                source = source_dir / filename
-                if source.exists():
-                    shutil.copy2(source, target_dir / filename)
+            # mcp-auth.json holds the OAuth tokens; copy verbatim.
+            src_auth = source_dir / "mcp-auth.json"
+            if src_auth.exists():
+                shutil.copy2(src_auth, target_dir / "mcp-auth.json")
+            # mcp-approvals.json is a list of "<server-id>-<hash>" approvals. The
+            # source namespace approves ALL of the user's servers, and an approval
+            # for a disabled server RE-ENABLES it (approve wins over disable — the
+            # same failure mode as --approve-mcps, verified live on MVL-03). Strip
+            # approvals for any server we're isolating so disable stays authoritative.
+            src_appr = source_dir / "mcp-approvals.json"
+            if src_appr.exists():
+                try:
+                    approvals = json.loads(src_appr.read_text(encoding="utf-8"))
+                except Exception:
+                    approvals = []
+                if isinstance(approvals, list):
+                    approvals = [
+                        a for a in approvals
+                        if not any(
+                            str(a) == d or str(a).startswith(d + "-") for d in disabled
+                        )
+                    ]
+                (target_dir / "mcp-approvals.json").write_text(
+                    json.dumps(approvals, indent=2), encoding="utf-8"
+                )
 
         # Server isolation: cursor-agent merges the global ~/.cursor/mcp.json and
         # every installed plugin into the run regardless of the workspace
@@ -309,7 +331,6 @@ class CursorAdapter(HostAdapter):
         # --force. The reliable lever is Cursor's per-project mcp-disabled.json
         # (an array of runtime server ids), which we stage into this run's
         # namespace so non-sanctioned servers "will no longer be loaded".
-        disabled = list(ctx.get("disabled_servers") or [])
         (target_dir / "mcp-disabled.json").write_text(
             json.dumps(disabled, indent=2), encoding="utf-8"
         )
