@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -242,14 +243,22 @@ class CursorAdapter(HostAdapter):
         # NOTE: cursor-agent has no documented --max-turns / step-limit flag; the
         # `max_turns` arg is intentionally ignored. json_schema is NOT enforced by
         # Cursor — the judge should run on a structured-output host (judge_host).
-        extra = cfg.get("extra_cursor_args") or []
-        cmd.extend([str(x) for x in extra])
-        # Server isolation: deny every server cursor-agent would merge in
-        # (global mcp.json + plugins) that is not this arm's sanctioned server.
-        # Use require_live_tool_servers (real runtime ids) when present, else
-        # expected_mcp_servers.
+        extra = [str(x) for x in (cfg.get("extra_cursor_args") or [])]
         discovered = _discover_available_servers(Path.home())
         disabled_servers = _servers_to_disable(arm_cfg, discovered)
+        # Guard: --approve-mcps force-approves EVERY merged server (global
+        # mcp.json + all plugins), which overrides the per-project
+        # mcp-disabled.json and silently re-contaminates the arm (verified live:
+        # the direct arm reached glean_default on every prompt with this flag).
+        # Drop it whenever we are isolating servers so isolation stays authoritative.
+        if disabled_servers and "--approve-mcps" in extra:
+            sys.stderr.write(
+                "[cursor] dropping --approve-mcps: it defeats mcp-disabled.json "
+                "server isolation. Unattended approval is handled by --force plus "
+                "staged mcp-approvals.json.\n"
+            )
+            extra = [x for x in extra if x != "--approve-mcps"]
+        cmd.extend(extra)
         ctx = {
             "cwd": str(ws),
             "ws": str(ws),

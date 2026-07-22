@@ -221,6 +221,20 @@ class CursorServerIsolationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(cursor_host._discover_available_servers(Path(tmp)), {})
 
+    def test_build_command_strips_approve_mcps_when_isolating(self):
+        from unittest import mock
+        disc = {
+            "glean_default": "glean_default",
+            "plugin-atlassian-atlassian": "plugin-atlassian-atlassian",
+        }
+        adapter = cursor_host.CursorAdapter()
+        with mock.patch.object(cursor_host, "_discover_available_servers", return_value=disc):
+            cfg = {"model": "m", "extra_cursor_args": ["--approve-mcps"]}
+            arm = {"expected_mcp_servers": ["glean_default"]}
+            cmd, ctx = adapter.build_command(Path("."), cfg, arm, "hi", Path("/tmp/xrun"))
+        self.assertNotIn("--approve-mcps", cmd)  # dropped: it defeats isolation
+        self.assertEqual(ctx["disabled_servers"], ["plugin-atlassian-atlassian"])
+
 
 class ServerPresentTest(unittest.TestCase):
     def test_exact_match_from_inventory(self):

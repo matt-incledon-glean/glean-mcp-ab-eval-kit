@@ -49,7 +49,8 @@
         "mcp__glean_default__find_skills",
         "mcp__glean_default__read_skill_files"
       ],
-      "preflight_prompt": "Use the Glean MCP tools to perform a harmless read-only search for a known internal page and return a one-sentence confirmation that retrieval worked."
+      "preflight_prompt": "Use the Glean MCP tools to perform a harmless read-only search for a known internal page and return a one-sentence confirmation that retrieval worked.",
+      "prompt_prefix": "Use the Glean MCP tools to research and answer the following request."
     },
     "direct": {
       "label": "Atlassian (direct)",
@@ -88,7 +89,9 @@
         "mcp__atlassian__createConfluenceFooterComment",
         "mcp__atlassian__createConfluenceInlineComment"
       ],
-      "preflight_prompt": "Use the Atlassian MCP tools to perform a harmless read-only lookup (for example, search for a Confluence page or fetch a Jira issue) and return a one-sentence confirmation that retrieval worked."
+      "preflight_prompt": "Use the Atlassian MCP tools to perform a harmless read-only lookup (for example, search for a Confluence page or fetch a Jira issue) and return a one-sentence confirmation that retrieval worked.",
+      "prompt_prefix": "Use the Atlassian MCP tools to research and answer the following request."
     }
-  }
+  },
+  "extra_cursor_args": []
 }
