@@ -6,9 +6,13 @@ marked `TODO(verify)`. See docs/hosts/cursor.md.
 
 Key differences from Claude Code (from Cursor docs, 2026-07):
   - Command: `cursor-agent -p "<prompt>" --output-format stream-json --force --trust`.
-  - Isolation: no `--strict-mcp-config` flag. We isolate by pointing `--workspace`
-    at a per-run dir that contains only this arm's `.cursor/mcp.json`, plus a
-    `.cursor/cli.json` permissions block for read-only gating (deny wins).
+  - Isolation: no `--strict-mcp-config` flag, and cursor-agent merges the global
+    ~/.cursor/mcp.json + installed plugins into every workspace, so a per-arm
+    `.cursor/mcp.json` can only *add* this arm's server. Real isolation is
+    enforced by staging Cursor's per-project `mcp-disabled.json` (an array of
+    runtime server ids) so every non-sanctioned server — including plugin
+    servers, which cli.json Mcp() deny does NOT gate under --force — is not
+    loaded. `.cursor/cli.json` still gates tools (read-only floor).
   - Cost: NOT exposed by Cursor — `reported_cost_usd` is always None; the kit's
     list-price-normalized `computed_cost_usd` is the cross-host cost metric.
   - Token usage: available via the TypeScript SDK for certain; via CLI JSON it is
@@ -21,6 +25,7 @@ Key differences from Claude Code (from Cursor docs, 2026-07):
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,8 +43,15 @@ _USAGE_ALIASES = {
 
 
 def _cursor_project_slug(path: Path) -> str:
-    """Return Cursor CLI's filesystem-safe project slug for an absolute path."""
-    return str(path.resolve()).lstrip("/").replace("/", "-")
+    """Return Cursor CLI's filesystem-safe project slug for an absolute path.
+
+    Cursor derives the ~/.cursor/projects/<slug> namespace by replacing every run
+    of non-alphanumeric characters with a single '-' and trimming leading/
+    trailing '-'. e.g. '/private/tmp/x/_cursor_ws' -> 'private-tmp-x-cursor-ws'.
+    Matching this exactly matters: the OAuth/approval state and mcp-disabled.json
+    we stage are only read if they land in the namespace Cursor actually uses.
+    """
+    return re.sub(r"[^a-zA-Z0-9]+", "-", str(path.resolve())).strip("-")
 
 
 def _load_arm_servers(root: Path, arm_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -66,9 +78,66 @@ def _load_arm_servers(root: Path, arm_cfg: Dict[str, Any]) -> Dict[str, Any]:
     return servers if isinstance(servers, dict) else {}
 
 
+def _norm_server(name: str) -> str:
+    """Match the core's normalize_server_name so adapter deny rules and the
+    reporting-side validity check agree on server identity."""
+    return re.sub(r"[^a-z0-9_-]+", "", str(name).lower().strip())
+
+
+def _discover_available_servers(cursor_home: Path) -> Dict[str, str]:
+    """Best-effort {runtime_server_id: normalized_id} for every MCP server
+    cursor-agent will merge into a workspace.
+
+    cursor-agent has no --strict-mcp-config flag, so an arm inherits (a) the
+    global ~/.cursor/mcp.json servers and (b) every installed plugin's servers.
+    A plugin server's runtime identifier is `plugin-<plugin.name>-<serverKey>`
+    (verified against plugin-atlassian-atlassian and plugin-glean-vnext-glean).
+    We enumerate both so callers can deny everything the arm is not supposed to
+    touch, instead of maintaining a brittle hand-written forbidden list.
+    """
+    found: Dict[str, str] = {}
+    base = cursor_home / ".cursor"
+    try:
+        data = json.loads((base / "mcp.json").read_text(encoding="utf-8"))
+        for key in (data.get("mcpServers") or {}):
+            found[key] = _norm_server(key)
+    except Exception:
+        pass
+    plugins_dir = base / "plugins"
+    if plugins_dir.is_dir():
+        for plugin_json in plugins_dir.rglob("plugin.json"):
+            try:
+                pj = json.loads(plugin_json.read_text(encoding="utf-8"))
+                pname = pj.get("name")
+                if not pname:
+                    continue
+                # plugin.json lives under .cursor-plugin/ or .claude-plugin/;
+                # the server manifest (.mcp.json) sits at the plugin root.
+                for cand in (
+                    plugin_json.parent / ".mcp.json",
+                    plugin_json.parent.parent / ".mcp.json",
+                ):
+                    if not cand.exists():
+                        continue
+                    md = json.loads(cand.read_text(encoding="utf-8"))
+                    for skey in (md.get("mcpServers") or {}):
+                        rid = f"plugin-{pname}-{skey}"
+                        found[rid] = _norm_server(rid)
+                    break
+            except Exception:
+                continue
+    return found
+
+
 def _permissions_from_arm(arm_cfg: Dict[str, Any]) -> Dict[str, List[str]]:
     """Translate the kit's allowed_tools/disallowed_tools into a Cursor
     `.cursor/cli.json` permissions block. Deny wins over allow.
+
+    NOTE: this gates *tools* (read-only floor + specific write tools). It does
+    NOT enforce server isolation: live testing showed cursor-agent honors
+    cli.json Mcp() deny rules for mcp.json servers but NOT for plugin-provided
+    servers under --force. Server isolation is done separately by staging an
+    `mcp-disabled.json` into the run's project namespace (see prepare()).
 
     TODO(verify): confirm the exact rule grammar Cursor accepts. Docs show
     `Mcp(server:tool)`, `Write(...)`, `Shell(...)`, `Read(...)` with `*`. We
@@ -91,6 +160,24 @@ def _permissions_from_arm(arm_cfg: Dict[str, Any]) -> Dict[str, List[str]]:
         if hard not in deny:
             deny.append(hard)
     return {"allow": allow, "deny": deny}
+
+
+def _servers_to_disable(arm_cfg: Dict[str, Any], discovered: Dict[str, str]) -> List[str]:
+    """Return the runtime server ids to disable for this arm: every discovered
+    server (global mcp.json + plugins) whose normalized id is not one of the
+    arm's sanctioned servers. Sanctioned = expected_mcp_servers UNION
+    require_live_tool_servers, so an arm may reach its target via either the
+    workspace mcp.json server or an equivalent plugin. This is what actually
+    enforces arm isolation on Cursor, via a staged mcp-disabled.json.
+    """
+    keep = {
+        _norm_server(x)
+        for x in (
+            list(arm_cfg.get("expected_mcp_servers") or [])
+            + list(arm_cfg.get("require_live_tool_servers") or [])
+        )
+    }
+    return sorted(rid for rid, norm in discovered.items() if norm not in keep)
 
 
 def _extract_usage(obj: Any) -> Dict[str, int]:
@@ -157,11 +244,22 @@ class CursorAdapter(HostAdapter):
         # Cursor — the judge should run on a structured-output host (judge_host).
         extra = cfg.get("extra_cursor_args") or []
         cmd.extend([str(x) for x in extra])
+        # Server isolation: deny every server cursor-agent would merge in
+        # (global mcp.json + plugins) that is not this arm's sanctioned server.
+        # Use require_live_tool_servers (real runtime ids) when present, else
+        # expected_mcp_servers.
+        discovered = _discover_available_servers(Path.home())
+        disabled_servers = _servers_to_disable(arm_cfg, discovered)
         ctx = {
             "cwd": str(ws),
             "ws": str(ws),
             "servers": _load_arm_servers(root, arm_cfg),
             "permissions": _permissions_from_arm(arm_cfg),
+            # Runtime server ids to disable for this arm (global mcp.json +
+            # plugin servers that are not this arm's sanctioned server). Staged
+            # as mcp-disabled.json in prepare() — the only mechanism that
+            # reliably keeps plugin servers out of the run.
+            "disabled_servers": disabled_servers,
             # Cursor stores MCP OAuth tokens/approvals under a project-path
             # namespace. The eval workspace is intentionally isolated, so stage
             # the already-authenticated local state into that namespace rather
@@ -189,12 +287,23 @@ class CursorAdapter(HostAdapter):
         # project namespace; never write these secrets into the repository.
         source_dir = Path(ctx.get("auth_source_dir", ""))
         target_dir = Path.home() / ".cursor" / "projects" / _cursor_project_slug(ws)
+        target_dir.mkdir(parents=True, exist_ok=True)
         if source_dir.is_dir():
-            target_dir.mkdir(parents=True, exist_ok=True)
             for filename in ("mcp-auth.json", "mcp-approvals.json"):
                 source = source_dir / filename
                 if source.exists():
                     shutil.copy2(source, target_dir / filename)
+
+        # Server isolation: cursor-agent merges the global ~/.cursor/mcp.json and
+        # every installed plugin into the run regardless of the workspace
+        # mcp.json, and cli.json Mcp() deny rules do not gate plugin servers under
+        # --force. The reliable lever is Cursor's per-project mcp-disabled.json
+        # (an array of runtime server ids), which we stage into this run's
+        # namespace so non-sanctioned servers "will no longer be loaded".
+        disabled = list(ctx.get("disabled_servers") or [])
+        (target_dir / "mcp-disabled.json").write_text(
+            json.dumps(disabled, indent=2), encoding="utf-8"
+        )
 
     def harvest(
         self,

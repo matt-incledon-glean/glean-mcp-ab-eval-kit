@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import glean_mcp_eval as gme  # noqa: E402
+from hosts import cursor as cursor_host  # noqa: E402
 
 
 class TranscriptParserTest(unittest.TestCase):
@@ -155,6 +156,70 @@ class BlindGradingTest(unittest.TestCase):
         self.assertEqual(g["completeness_direct"], 4)
         self.assertEqual(g["groundedness_glean"], 3)
         self.assertEqual(g["groundedness_direct"], 5)
+
+
+class CursorServerIsolationTest(unittest.TestCase):
+    def test_permissions_gate_tools_not_servers(self):
+        arm = {
+            "allowed_tools": ["mcp__glean_default__search"],
+            "disallowed_tools": ["mcp__glean_default__run_tool"],
+        }
+        perms = cursor_host._permissions_from_arm(arm)
+        self.assertIn("Mcp(glean_default:search)", perms["allow"])
+        self.assertIn("Mcp(glean_default:run_tool)", perms["deny"])
+        self.assertIn("Write(**)", perms["deny"])
+        self.assertIn("Shell(**)", perms["deny"])
+
+    def test_servers_to_disable_uses_require_live_then_expected(self):
+        discovered = {
+            "glean_default": "glean_default",
+            "plugin-atlassian-atlassian": "plugin-atlassian-atlassian",
+            "plugin-glean-vnext-glean": "plugin-glean-vnext-glean",
+        }
+        direct = {
+            "expected_mcp_servers": ["atlassian"],
+            "require_live_tool_servers": ["plugin-atlassian-atlassian"],
+        }
+        self.assertEqual(
+            cursor_host._servers_to_disable(direct, discovered),
+            ["glean_default", "plugin-glean-vnext-glean"],
+        )
+        glean = {"expected_mcp_servers": ["glean_default"]}
+        self.assertEqual(
+            cursor_host._servers_to_disable(glean, discovered),
+            ["plugin-atlassian-atlassian", "plugin-glean-vnext-glean"],
+        )
+
+    def test_project_slug_matches_cursor(self):
+        # Cursor collapses non-alphanumeric runs to '-'; '_cursor_ws' -> 'cursor-ws'.
+        slug = cursor_host._cursor_project_slug(Path("/private/tmp/x/MVL-01/_cursor_ws"))
+        self.assertTrue(slug.endswith("MVL-01-cursor-ws"))
+        self.assertNotIn("_", slug)
+
+    def test_discover_available_servers_global_and_plugins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cur = home / ".cursor"
+            (cur).mkdir()
+            (cur / "mcp.json").write_text(
+                json.dumps({"mcpServers": {"glean_default": {"url": "x"}}}), encoding="utf-8"
+            )
+            # plugin.json under .cursor-plugin/, .mcp.json at plugin root
+            proot = cur / "plugins" / "cache" / "gleanwork" / "glean-vnext" / "abc"
+            (proot / ".cursor-plugin").mkdir(parents=True)
+            (proot / ".cursor-plugin" / "plugin.json").write_text(
+                json.dumps({"name": "glean-vnext"}), encoding="utf-8"
+            )
+            (proot / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {"glean": {"command": "node"}}}), encoding="utf-8"
+            )
+            found = cursor_host._discover_available_servers(home)
+        self.assertIn("glean_default", found)
+        self.assertIn("plugin-glean-vnext-glean", found)  # plugin-<name>-<serverKey>
+
+    def test_discover_missing_home_is_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(cursor_host._discover_available_servers(Path(tmp)), {})
 
 
 class ServerPresentTest(unittest.TestCase):
