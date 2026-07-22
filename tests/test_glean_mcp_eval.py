@@ -189,6 +189,16 @@ class JudgeAliasNormalizationTest(unittest.TestCase):
         self.assertEqual(bg["confidence"], "low")
 
 
+class PromptPrefixTest(unittest.TestCase):
+    def test_prefix_prepended_when_present(self):
+        out = gme.apply_prompt_prefix({"prompt_prefix": "Use the Atlassian MCP."}, "Question?")
+        self.assertEqual(out, "Use the Atlassian MCP.\n\nQuestion?")
+
+    def test_no_prefix_returns_prompt_unchanged(self):
+        self.assertEqual(gme.apply_prompt_prefix({}, "Question?"), "Question?")
+        self.assertEqual(gme.apply_prompt_prefix({"prompt_prefix": "  "}, "Question?"), "Question?")
+
+
 class ServerIsolationValidityTest(unittest.TestCase):
     CFG = {
         "arms": {

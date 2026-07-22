@@ -730,6 +730,18 @@ def render_wrapper(wrapper: str, row: Dict[str, str]) -> str:
     return out
 
 
+def apply_prompt_prefix(acfg: Dict[str, Any], prompt_text: str) -> str:
+    """Prepend an arm's optional `prompt_prefix` steering instruction.
+
+    Used to name the retrieval tool an arm should use (e.g. "Use the Atlassian
+    MCP..."). Symmetric across arms and orthogonal to isolation: the
+    server-isolation guardrail still flags any run that reaches another server,
+    so steering guides but never hides contamination.
+    """
+    prefix = str((acfg or {}).get("prompt_prefix") or "").strip()
+    return prefix + "\n\n" + prompt_text if prefix else prompt_text
+
+
 def command_run(args: argparse.Namespace) -> int:
     config_path, cfg = load_config(args.config)
     root = repo_root_for_config(config_path)
@@ -750,6 +762,12 @@ def command_run(args: argparse.Namespace) -> int:
     for i, row in enumerate(prompts, 1):
         pid = safe_prompt_id(row["ID"])
         prompt_text = render_wrapper(wrapper, row)
+        # Optional per-arm steering: prepend an instruction naming the retrieval
+        # tool the arm is meant to use (e.g. "Use the Atlassian MCP..."). This
+        # reduces tool-selection noise between arms; the server-isolation
+        # guardrail still flags any run that ignores it and reaches another
+        # server, so steering never masks contamination.
+        prompt_text = apply_prompt_prefix(acfg, prompt_text)
         run_dir = out_root / pid
         metadata = {
             "id": row.get("ID"),
