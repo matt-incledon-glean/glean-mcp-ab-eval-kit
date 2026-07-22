@@ -983,12 +983,41 @@ def command_grade(args: argparse.Namespace) -> int:
                 host=cfg.get("judge_host") or "claude-code",
             )
             raw = read_json(Path(rec["raw_output_path"])) if rec.get("raw_output_path") and Path(rec["raw_output_path"]).exists() else {}
-            blind_grade = raw.get("structured_output")
-            if not blind_grade and isinstance(raw.get("result"), str):
-                try:
-                    blind_grade = json.loads(raw["result"])
-                except Exception:
-                    blind_grade = None
+            # Claude returns one JSON object; Cursor's stream-json adapter stores
+            # a list of events, with the final answer in the result event. Cursor
+            # also does not enforce --json-schema, so accept its equivalent
+            # quality_* fields and normalize them to the kit schema below.
+            parse_obj = raw
+            if isinstance(raw, list):
+                result_events = [e for e in raw if isinstance(e, dict) and e.get("type") == "result"]
+                parse_obj = result_events[-1] if result_events else {}
+            blind_grade = parse_obj.get("structured_output") if isinstance(parse_obj, dict) else None
+            if not blind_grade and isinstance(parse_obj, dict) and isinstance(parse_obj.get("result"), str):
+                result_text = parse_obj["result"]
+                candidates = re.findall(r"```(?:json)?\\s*(\\{.*?\\})\\s*```", result_text, flags=re.DOTALL | re.IGNORECASE)
+                # Cursor may omit fences and prepend analysis. Try every opening
+                # brace from the end, using raw_decode to tolerate trailing prose.
+                candidates += [result_text[i:] for i, ch in enumerate(result_text) if ch == "{"]
+                for candidate in reversed(candidates):
+                    try:
+                        parsed, _ = json.JSONDecoder().raw_decode(candidate.strip())
+                        if isinstance(parsed, dict):
+                            blind_grade = parsed
+                            break
+                    except Exception:
+                        continue
+            if isinstance(blind_grade, dict):
+                if "winner" not in blind_grade:
+                    blind_grade["winner"] = blind_grade.get("overall_winner") or blind_grade.get("quality_winner")
+                if "efficiency_winner" not in blind_grade:
+                    blind_grade["efficiency_winner"] = blind_grade.get("token_efficiency_winner")
+                if "usefulness_winner" not in blind_grade and blind_grade.get("quality_winner"):
+                    blind_grade["usefulness_winner"] = blind_grade["quality_winner"]
+                if "reasoning" not in blind_grade:
+                    blind_grade["reasoning"] = blind_grade.get("quality_reasoning") or blind_grade.get("rationale")
+                if isinstance(blind_grade.get("confidence"), (int, float)):
+                    score = float(blind_grade["confidence"])
+                    blind_grade["confidence"] = "high" if score >= 0.8 else "medium" if score >= 0.5 else "low"
             if not isinstance(blind_grade, dict):
                 failures += 1
                 blind_grade = None
@@ -1047,8 +1076,15 @@ def collect_aggregate_rows(res: Path) -> List[Dict[str, Any]]:
             d_usage = direct.get("usage") or {}
             g_marginal = int(g_usage.get("input_tokens", 0)) + int(g_usage.get("output_tokens", 0))
             d_marginal = int(d_usage.get("input_tokens", 0)) + int(d_usage.get("output_tokens", 0))
-            g_rcost = float(glean.get("total_cost_usd_reported_by_claude") or 0.0)
-            d_rcost = float(direct.get("total_cost_usd_reported_by_claude") or 0.0)
+            g_rcost_raw = glean.get("total_cost_usd_reported_by_claude")
+            d_rcost_raw = direct.get("total_cost_usd_reported_by_claude")
+            g_rcost = float(g_rcost_raw) if isinstance(g_rcost_raw, (int, float)) else ""
+            d_rcost = float(d_rcost_raw) if isinstance(d_rcost_raw, (int, float)) else ""
+            g_reported_savings = (
+                round((d_rcost - g_rcost) / d_rcost * 100.0, 2)
+                if isinstance(g_rcost, (int, float)) and isinstance(d_rcost, (int, float)) and d_rcost
+                else ""
+            )
             g_lat = glean.get("duration_ms_reported_by_claude")
             d_lat = direct.get("duration_ms_reported_by_claude")
             rows.append({
@@ -1063,9 +1099,9 @@ def collect_aggregate_rows(res: Path) -> List[Dict[str, Any]]:
                 "glean_cost_usd": gcost,
                 "direct_cost_usd": dcost,
                 "cost_savings_pct": round((dcost - gcost) / dcost * 100.0, 2) if dcost else "",
-                "glean_reported_cost_usd": round(g_rcost, 6),
-                "direct_reported_cost_usd": round(d_rcost, 6),
-                "reported_cost_savings_pct": round((d_rcost - g_rcost) / d_rcost * 100.0, 2) if d_rcost else "",
+                "glean_reported_cost_usd": round(g_rcost, 6) if isinstance(g_rcost, (int, float)) else "",
+                "direct_reported_cost_usd": round(d_rcost, 6) if isinstance(d_rcost, (int, float)) else "",
+                "reported_cost_savings_pct": g_reported_savings,
                 "glean_marginal_tokens": g_marginal,
                 "direct_marginal_tokens": d_marginal,
                 "marginal_token_savings_pct": round((d_marginal - g_marginal) / d_marginal * 100.0, 2) if d_marginal else "",
@@ -1153,12 +1189,17 @@ def command_report(args: argparse.Namespace) -> int:
     d_fixed_avg = col_mean("direct_cache_write_tokens")
     gt_avg = col_mean("glean_total_tokens")
     dt_avg = col_mean("direct_total_tokens")
-    # Cost: reported = Claude Code's own per-run figure (primary); list = normalized rate card.
+    # Cost: reported = host-emitted billed/per-run figure when available; list = normalized rate card.
+    reported_cost_rows = [
+        r for r in denom_rows
+        if r.get("glean_reported_cost_usd") not in ("", None) and r.get("direct_reported_cost_usd") not in ("", None)
+    ]
+    reported_cost_available = bool(reported_cost_rows)
     g_rc_avg = col_mean("glean_reported_cost_usd")
     d_rc_avg = col_mean("direct_reported_cost_usd")
     gc_avg = col_mean("glean_cost_usd")
     dc_avg = col_mean("direct_cost_usd")
-    # Latency: wall-clock milliseconds reported by Claude Code.
+    # Latency: wall-clock milliseconds reported by the host adapter, when available.
     g_lat_avg = col_mean("glean_latency_ms")
     d_lat_avg = col_mean("direct_latency_ms")
 
@@ -1170,7 +1211,7 @@ def command_report(args: argparse.Namespace) -> int:
 
     marginal_savings = pct_lower(d_marg_avg, g_marg_avg)
     total_token_savings = pct_lower(dt_avg, gt_avg)
-    reported_cost_savings = pct_lower(d_rc_avg, g_rc_avg)
+    reported_cost_savings = pct_lower(d_rc_avg, g_rc_avg) if reported_cost_available else None
     list_cost_savings = pct_lower(dc_avg, gc_avg)
     latency_savings = pct_lower(d_lat_avg, g_lat_avg)
     invalid_count = len(rows) - len(valid)
@@ -1180,8 +1221,25 @@ def command_report(args: argparse.Namespace) -> int:
             return f" (95% CI {ci[0]:.1f} to {ci[1]:.1f}%, n={len(denom_rows)}, bootstrap)"
         return f" (n={len(denom_rows)}; need ≥2 rows for a CI)"
 
-    reported_cost_ci = bootstrap_savings_ci([(r["glean_reported_cost_usd"], r["direct_reported_cost_usd"]) for r in denom_rows])
+    reported_cost_ci = bootstrap_savings_ci([(r["glean_reported_cost_usd"], r["direct_reported_cost_usd"]) for r in reported_cost_rows]) if reported_cost_available else None
     marginal_ci = bootstrap_savings_ci([(r["glean_marginal_tokens"], r["direct_marginal_tokens"]) for r in denom_rows])
+    host_name = str(cfg.get("host") or "configured host")
+    host_label = host_name.replace("-", " ").title()
+    reported_cost_row = (
+        f"| Avg host-reported cost / task | ${g_rc_avg:,.4f} | ${d_rc_avg:,.4f} | {reported_cost_savings:.1f}% lower for Glean |"
+        if reported_cost_available and reported_cost_savings is not None
+        else "| Avg host-reported cost / task | N/A | N/A | N/A |"
+    )
+    reported_cost_note = (
+        f"> Host-reported cost savings for Glean: **{reported_cost_savings:.1f}%**{ci_str(reported_cost_ci)}."
+        if reported_cost_available and reported_cost_savings is not None
+        else f"> Host-reported billed cost is unavailable for these `{host_name}` runs because the {host_label} adapter did not emit per-run cost. Use list-price-normalized cost for cost comparison."
+    )
+    token_guidance = (
+        "Prefer marginal tokens + host-reported cost for headline claims."
+        if reported_cost_available
+        else "Prefer marginal tokens + list-price-normalized cost for headline claims because host-reported cost is unavailable."
+    )
     md = f"""# Aggregate summary
 
 Generated: {now_iso()}
@@ -1197,16 +1255,16 @@ Eval: `{cfg.get('eval_name', '')}`
 
 ## Cost
 
-Primary metric is the cost Claude Code reports per run. List-price-normalized cost applies the configurable `pricing_per_million` rates uniformly across both arms.
+Host-reported cost is shown only when the selected run host emits a per-run billed-cost field. List-price-normalized cost applies the configurable `pricing_per_million` rates uniformly across both arms.
 
 | Metric | Glean MCP | Direct MCP | Delta |
 |---|---:|---:|---:|
-| Avg reported cost / task | ${g_rc_avg:,.4f} | ${d_rc_avg:,.4f} | {reported_cost_savings:.1f}% lower for Glean |
+{reported_cost_row}
 | Avg list-price-normalized cost / task | ${gc_avg:,.4f} | ${dc_avg:,.4f} | {list_cost_savings:.1f}% lower for Glean |
 
-> List-price-normalized cost is a rate-card comparison, not billed spend. Verify `pricing_per_million` against current model list prices; it can diverge sharply from reported cost when cache-creation tokens dominate.
+> List-price-normalized cost is a rate-card comparison, not billed spend. Verify `pricing_per_million` against current model list prices; it can diverge from host-reported cost when cache-creation tokens dominate or when the host does not expose billed cost.
 >
-> Reported-cost savings for Glean: **{reported_cost_savings:.1f}%**{ci_str(reported_cost_ci)}.
+{reported_cost_note}
 
 ## Tokens
 
@@ -1218,7 +1276,7 @@ Marginal = per-prompt work (input + output). Fixed = per-session cache creation 
 | Avg fixed (cache-creation) tokens / task | {g_fixed_avg:,.0f} | {d_fixed_avg:,.0f} | — |
 | Avg total tokens / task | {gt_avg:,.0f} | {dt_avg:,.0f} | {total_token_savings:.1f}% lower for Glean |
 
-> Prefer marginal tokens + reported cost for headline claims. Raw totals are dominated by per-session cache creation and can mislead.
+> {token_guidance} Raw totals are dominated by per-session cache creation and can mislead.
 >
 > Marginal-token savings for Glean: **{marginal_savings:.1f}%**{ci_str(marginal_ci)}.
 
@@ -1258,7 +1316,7 @@ Detailed rows: [`aggregate_rows.csv`](aggregate_rows.csv)
         "aggregate_summary_md": str(summary_path),
         "avg_marginal_token_savings_pct": round(marginal_savings, 2),
         "avg_total_token_savings_pct": round(total_token_savings, 2),
-        "avg_reported_cost_savings_pct": round(reported_cost_savings, 2),
+        "avg_reported_cost_savings_pct": round(reported_cost_savings, 2) if reported_cost_savings is not None else None,
         "avg_list_cost_savings_pct": round(list_cost_savings, 2),
         "avg_latency_savings_pct": round(latency_savings, 2),
         "reported_cost_savings_ci_pct": reported_cost_ci,
@@ -1286,7 +1344,7 @@ def command_package(args: argparse.Namespace) -> int:
     for p in sorted(res.rglob("*")):
         if not p.is_file():
             continue
-        if p == zip_path:
+        if p in (zip_path, manifest_path):
             continue
         rel = p.relative_to(res).as_posix()
         files.append({"path": rel, "sha256": sha256_file(p), "bytes": p.stat().st_size})
